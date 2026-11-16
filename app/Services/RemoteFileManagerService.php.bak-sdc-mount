@@ -1,0 +1,2010 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\ManagedServer;
+use phpseclib3\Crypt\PublicKeyLoader;
+use phpseclib3\Net\SFTP;
+use RuntimeException;
+use Throwable;
+
+class RemoteFileManagerService
+{
+    private const CONNECTION_TIMEOUT = 10;
+    private const COMMAND_TIMEOUT = 15;
+    private const FORMAT_COMMAND_TIMEOUT = 3600;
+
+    /**
+     * Membuat koneksi SFTP, memverifikasi host key sebelum autentikasi,
+     * lalu menentukan direktori home sebagai batas akses awal.
+     */
+    private function connect(ManagedServer $server): array
+    {
+        if (!in_array($server->connection_protocol, ['ssh', 'windows_openssh'], true)) {
+            throw new RuntimeException('File Manager hanya mendukung SSH atau Windows OpenSSH.');
+        }
+
+        if ($server->os_type !== 'linux') {
+            throw new RuntimeException('File Manager tahap awal hanya mendukung server Linux.');
+        }
+
+        $host = $server->hostname ?: $server->ip_address;
+
+        if (!$host) {
+            throw new RuntimeException('Hostname atau IP address server belum diisi.');
+        }
+
+        $sftp = new SFTP($host, (int) $server->port, self::CONNECTION_TIMEOUT);
+
+        try {
+            $publicHostKey = $sftp->getServerPublicHostKey();
+
+            if ($publicHostKey === false || !is_string($publicHostKey)) {
+                throw new RuntimeException('Server tidak memberikan host key SSH yang valid.');
+            }
+
+            $parts = preg_split('/\s+/', trim($publicHostKey), 2);
+
+            if (
+                count($parts) !== 2 ||
+                !preg_match('/^[A-Za-z0-9@._+-]+$/', $parts[0])
+            ) {
+                throw new RuntimeException('Format host key SSH tidak valid.');
+            }
+
+            $rawKey = base64_decode($parts[1], true);
+
+            if ($rawKey === false || $rawKey === '') {
+                throw new RuntimeException('Public host key SSH tidak valid.');
+            }
+
+            $fingerprint = 'SHA256:' . rtrim(
+                base64_encode(hash('sha256', $rawKey, true)),
+                '='
+            );
+
+            if ($server->verify_host_key) {
+                if (!$server->host_key_fingerprint) {
+                    throw new RuntimeException(
+                        'Fingerprint host key belum didaftarkan. File Manager menolak koneksi.'
+                    );
+                }
+
+                if (!hash_equals($server->host_key_fingerprint, $fingerprint)) {
+                    throw new RuntimeException(
+                        'Fingerprint host key tidak cocok. Koneksi SFTP ditolak.'
+                    );
+                }
+            }
+
+            // Autentikasi hanya dilakukan setelah pemeriksaan host key.
+            if ($server->auth_method === 'password') {
+                $authenticated = $sftp->login(
+                    $server->username,
+                    $server->password
+                );
+            } elseif ($server->auth_method === 'private_key') {
+                if (!$server->private_key) {
+                    throw new RuntimeException('Private key belum tersedia.');
+                }
+
+                try {
+                    $key = PublicKeyLoader::load(
+                        $server->private_key,
+                        $server->private_key_passphrase ?: false
+                    );
+                } catch (Throwable) {
+                    throw new RuntimeException(
+                        'Private key tidak valid atau passphrase tidak sesuai.'
+                    );
+                }
+
+                $authenticated = $sftp->login($server->username, $key);
+            } else {
+                throw new RuntimeException('Metode autentikasi tidak didukung.');
+            }
+
+            if (!$authenticated) {
+                throw new RuntimeException('Autentikasi SSH gagal.');
+            }
+
+            $sftp->setTimeout(self::COMMAND_TIMEOUT);
+
+            // Ambil HOME dari sesi SSH tanpa input pengguna.
+            $home = trim((string) $sftp->exec('printf "%s\n" "$HOME"'));
+
+            if ($home === '' || !str_starts_with($home, '/')) {
+                $home = (string) $sftp->realpath('.');
+            }
+
+            $root = $sftp->realpath($home);
+
+            if (
+                !is_string($root) ||
+                $root === '' ||
+                !str_starts_with($root, '/') ||
+                $root === '/'
+            ) {
+                throw new RuntimeException(
+                    'Direktori home SSH tidak valid. File Manager tidak dapat menentukan batas akses.'
+                );
+            }
+
+            return [
+                'sftp' => $sftp,
+                'root' => rtrim($root, '/') ?: '/',
+                'fingerprint' => $fingerprint,
+            ];
+        } catch (Throwable $exception) {
+            $sftp->disconnect();
+
+            if ($exception instanceof RuntimeException) {
+                throw $exception;
+            }
+
+            throw new RuntimeException(
+                'Gagal membuat koneksi File Manager melalui SFTP.'
+            );
+        }
+    }
+
+    private function isPathWithinRoot(string $path, string $root): bool
+    {
+        $root = rtrim($root, '/') ?: '/';
+
+        if ($root === '/') {
+            return str_starts_with($path, '/');
+        }
+
+        return $path === $root || str_starts_with($path, $root . '/');
+    }
+
+    /**
+     * Root filesystem OS hanya boleh dibaca.
+     * HOME dan mount data terverifikasi tetap menggunakan izin normal.
+     */
+    private function isReadOnlySystemPath(
+        string $path,
+        string $homeRoot,
+        array $allowedRoots = []
+    ): bool {
+        $path = rtrim($path, '/') ?: '/';
+        $homeRoot = rtrim($homeRoot, '/') ?: '/';
+
+        if (
+            $homeRoot !== '/' &&
+            $this->isPathWithinRoot($path, $homeRoot)
+        ) {
+            return false;
+        }
+
+        foreach ($allowedRoots as $allowedRoot) {
+            if (
+                is_string($allowedRoot) &&
+                $allowedRoot !== '/' &&
+                $this->isPathWithinRoot($path, $allowedRoot)
+            ) {
+                return false;
+            }
+        }
+
+        return $this->isPathWithinRoot($path, '/');
+    }
+
+    /**
+     * Mount point yang dapat dijelajahi harus berasal dari perangkat
+     * block langsung, bukan root filesystem, bind mount, atau ancestor HOME.
+     */
+    private function allowedStorageMountRoots(SFTP $sftp, string $homeRoot): array
+    {
+        // Ambil daftar perangkat block yang benar-benar terdeteksi.
+        // Loop device dan ROM sengaja tidak dimasukkan.
+        $lsblkOutput = $sftp->exec(
+            'LC_ALL=C lsblk --json --output PATH,TYPE 2>/dev/null'
+        );
+
+        $blockData = is_string($lsblkOutput)
+            ? json_decode($lsblkOutput, true)
+            : null;
+
+        $blockDevices = is_array($blockData)
+            ? ($blockData['blockdevices'] ?? [])
+            : [];
+
+        if (!is_array($blockDevices)) {
+            return [];
+        }
+
+        $eligibleTypes = ['disk', 'part', 'lvm', 'crypt', 'mpath'];
+        $blockSources = [];
+
+        $collectBlockDevices = function (array $devices) use (
+            &$collectBlockDevices,
+            &$blockSources,
+            $eligibleTypes
+        ): void {
+            foreach ($devices as $device) {
+                if (!is_array($device)) {
+                    continue;
+                }
+
+                $path = trim((string) ($device['path'] ?? ''));
+                $type = strtolower(trim((string) ($device['type'] ?? '')));
+
+                if (
+                    preg_match('~\A/dev/[A-Za-z0-9._+/-]+\z~D', $path) &&
+                    (
+                        in_array($type, $eligibleTypes, true) ||
+                        str_starts_with($type, 'raid')
+                    )
+                ) {
+                    $blockSources[$path] = true;
+                }
+
+                if (is_array($device['children'] ?? null)) {
+                    $collectBlockDevices($device['children']);
+                }
+            }
+        };
+
+        $collectBlockDevices($blockDevices);
+
+        if ($blockSources === []) {
+            return [];
+        }
+
+        $mountOutput = $sftp->exec(
+            'LC_ALL=C findmnt --json --output SOURCE,TARGET,FSTYPE,OPTIONS 2>/dev/null'
+        );
+
+        $mountData = is_string($mountOutput)
+            ? json_decode($mountOutput, true)
+            : null;
+
+        $filesystems = is_array($mountData)
+            ? ($mountData['filesystems'] ?? [])
+            : [];
+
+        if (!is_array($filesystems)) {
+            return [];
+        }
+
+        $homeRoot = rtrim($homeRoot, '/') ?: '/';
+        $allowed = [];
+
+        // findmnt menghasilkan struktur pohon; periksa seluruh children.
+        $collectMounts = function (array $items) use (
+            &$collectMounts,
+            &$allowed,
+            $blockSources,
+            $homeRoot,
+            $sftp
+        ): void {
+            foreach ($items as $filesystem) {
+                if (!is_array($filesystem)) {
+                    continue;
+                }
+
+                $device = trim((string) ($filesystem['source'] ?? ''));
+                $target = trim((string) ($filesystem['target'] ?? ''));
+                $options = strtolower((string) ($filesystem['options'] ?? ''));
+
+                if (isset($blockSources[$device])) {
+                    if ($target === '/') {
+                        $optionList = explode(',', $options);
+                        $isBindMount =
+                            in_array('bind', $optionList, true) ||
+                            in_array('rbind', $optionList, true);
+
+                        $canonicalRoot = $sftp->realpath('/');
+
+                        if (
+                            !$isBindMount &&
+                            $canonicalRoot === '/' &&
+                            $sftp->is_dir('/')
+                        ) {
+                            $allowed['/'] = true;
+                        }
+                    }
+                    if (
+                        $target !== '' &&
+                        str_starts_with($target, '/') &&
+                        $target !== '/' &&
+                        !str_contains($target, "\0") &&
+                        !str_contains($target, '\\')
+                    ) {
+                        $target = rtrim($target, '/') ?: '/';
+
+                        if (!in_array('..', explode('/', $target), true)) {
+                            $optionList = explode(',', $options);
+
+                            $isBindMount =
+                                in_array('bind', $optionList, true) ||
+                                in_array('rbind', $optionList, true);
+
+                            $overlapsHome =
+                                $this->isPathWithinRoot($target, $homeRoot) ||
+                                $this->isPathWithinRoot($homeRoot, $target);
+
+                            if (!$isBindMount && !$overlapsHome) {
+                                $canonical = $sftp->realpath($target);
+
+                                if (
+                                    is_string($canonical) &&
+                                    $canonical === $target &&
+                                    $sftp->is_dir($target)
+                                ) {
+                                    $allowed[$target] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (is_array($filesystem['children'] ?? null)) {
+                    $collectMounts($filesystem['children']);
+                }
+            }
+        };
+
+        $collectMounts($filesystems);
+
+        $roots = array_keys($allowed);
+
+        usort(
+            $roots,
+            static fn (string $a, string $b): int => strlen($b) <=> strlen($a)
+        );
+
+        return $roots;
+    }
+
+    /**
+     * HOME dan mount point tambahan yang sudah diverifikasi menjadi
+     * batas akses untuk operasi file yang menggunakan resolvePath().
+     */
+    private function resolvePath(
+        SFTP $sftp,
+        string $root,
+        ?string $requestedPath,
+        array $allowedRoots = []
+    ): string {
+        $requestedPath = $requestedPath ?? '';
+        $root = rtrim($root, '/') ?: '/';
+
+        if (str_contains($requestedPath, "\0")) {
+            throw new RuntimeException('Path mengandung karakter yang tidak valid.');
+        }
+
+        if (in_array('..', explode('/', $requestedPath), true)) {
+            throw new RuntimeException('Akses path di luar direktori yang diizinkan ditolak.');
+        }
+
+        $authorizedRoot = $root;
+
+        if ($requestedPath === '' || $requestedPath === '.') {
+            $relativePath = '';
+        } elseif (str_starts_with($requestedPath, '/')) {
+            if (!$this->isPathWithinRoot($requestedPath, $root)) {
+                $matchedRoot = null;
+
+                foreach ($allowedRoots as $allowedRoot) {
+                    if (
+                        is_string($allowedRoot) &&
+                        $this->isPathWithinRoot($requestedPath, $allowedRoot)
+                    ) {
+                        $matchedRoot = $allowedRoot;
+                        break;
+                    }
+                }
+
+                if ($matchedRoot === null) {
+                    throw new RuntimeException(
+                        'Akses di luar direktori home dan mount point yang diizinkan ditolak.'
+                    );
+                }
+
+                $authorizedRoot = $matchedRoot;
+            }
+
+            $relativePath = $requestedPath === $authorizedRoot
+                ? ''
+                : substr($requestedPath, strlen($authorizedRoot));
+        } else {
+            $relativePath = $requestedPath;
+        }
+
+        $segments = array_values(array_filter(
+            explode('/', $relativePath),
+            static fn (string $segment): bool => $segment !== '' && $segment !== '.'
+        ));
+
+        $current = $authorizedRoot;
+        $lastIndex = count($segments) - 1;
+
+        foreach ($segments as $index => $segment) {
+            $entries = $sftp->rawlist($current);
+
+            if (
+                !is_array($entries) ||
+                !isset($entries[$segment]) ||
+                !is_array($entries[$segment])
+            ) {
+                throw new RuntimeException('Path tidak ditemukan atau tidak dapat diakses.');
+            }
+
+            $entry = $entries[$segment];
+            $mode = isset($entry['mode']) ? (int) $entry['mode'] : null;
+            $entryType = isset($entry['type']) ? (int) $entry['type'] : null;
+            $unixType = $mode !== null ? ($mode & 0170000) : null;
+
+            if ($entryType === 3 || $unixType === 0120000) {
+                throw new RuntimeException('Akses melalui symbolic link tidak diizinkan.');
+            }
+
+            $isDirectory = $entryType === 2 || $unixType === 0040000;
+            $isRegularFile = $entryType === 1 || $unixType === 0100000;
+
+            if (!$isDirectory && !$isRegularFile) {
+                throw new RuntimeException(
+                    'Tipe file tidak didukung atau tidak dapat diverifikasi.'
+                );
+            }
+
+            if ($index !== $lastIndex && !$isDirectory) {
+                throw new RuntimeException('Komponen path bukan direktori.');
+            }
+
+            $candidate = rtrim($current, '/') . '/' . $segment;
+            $canonical = $sftp->realpath($candidate);
+
+            if (!is_string($canonical) || $canonical === '') {
+                throw new RuntimeException('Path tidak ditemukan atau tidak dapat diakses.');
+            }
+
+            if (!$this->isPathWithinRoot($canonical, $authorizedRoot)) {
+                throw new RuntimeException('Akses di luar direktori yang diizinkan ditolak.');
+            }
+
+            $current = $canonical;
+        }
+
+        return $current;
+    }
+
+    /**
+     * Daftar direktori dan metadata file.
+     */
+    public function listDirectory(
+        ManagedServer $server,
+        ?string $requestedPath = null
+    ): array {
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $root = $connection['root'];
+            $allowedRoots = $this->allowedStorageMountRoots($sftp, $root);
+            $path = $this->resolvePath($sftp, $root, $requestedPath, $allowedRoots);
+
+            $navigationRoot = $root;
+
+            if (!$this->isPathWithinRoot($path, $root)) {
+                foreach ($allowedRoots as $allowedRoot) {
+                    if ($this->isPathWithinRoot($path, $allowedRoot)) {
+                        $navigationRoot = $allowedRoot;
+                        break;
+                    }
+                }
+            }
+
+            if (!$sftp->is_dir($path)) {
+                throw new RuntimeException('Path yang diminta bukan direktori.');
+            }
+
+            $entries = $sftp->rawlist($path);
+
+            if (!is_array($entries)) {
+                throw new RuntimeException('Gagal membaca isi direktori remote.');
+            }
+
+            $files = [];
+
+            foreach ($entries as $name => $entry) {
+                if (!is_array($entry) || in_array($name, ['.', '..'], true)) {
+                    continue;
+                }
+
+                $mode = isset($entry['mode']) ? (int) $entry['mode'] : null;
+                $entryType = isset($entry['type']) ? (int) $entry['type'] : null;
+
+                // SFTP v3: 1=file, 2=directory, 3=symlink.
+                // Gunakan Unix mode sebagai fallback jika tipe tidak tersedia.
+                if ($entryType === null && $mode !== null) {
+                    $unixType = $mode & 0170000;
+
+                    $entryType = match ($unixType) {
+                        0040000 => 2,
+                        0120000 => 3,
+                        0100000 => 1,
+                        default => 4,
+                    };
+                }
+
+                $type = match ($entryType) {
+                    2 => 'directory',
+                    3 => 'symlink',
+                    1 => 'file',
+                    default => 'special',
+                };
+
+                $files[] = [
+                    'name' => (string) $name,
+                    'path' => rtrim($path, '/') . '/' . $name,
+                    'type' => $type,
+                    'size' => isset($entry['size']) ? (int) $entry['size'] : null,
+                    'modified_at' => isset($entry['mtime']) ? (int) $entry['mtime'] : null,
+                    'permissions' => $mode !== null
+                        ? sprintf('%04o', $mode & 07777)
+                        : null,
+                    'is_symlink' => $type === 'symlink',
+                ];
+            }
+
+            usort($files, static function (array $a, array $b): int {
+                $priority = [
+                    'directory' => 0,
+                    'file' => 1,
+                    'symlink' => 2,
+                    'special' => 3,
+                ];
+
+                $typeOrder = ($priority[$a['type']] ?? 9)
+                    <=> ($priority[$b['type']] ?? 9);
+
+                if ($typeOrder !== 0) {
+                    return $typeOrder;
+                }
+
+                return strnatcasecmp($a['name'], $b['name']);
+            });
+
+            $parent = null;
+
+            if ($path !== $navigationRoot) {
+                $parentPath = dirname($path);
+
+                if ($this->isPathWithinRoot($parentPath, $navigationRoot)) {
+                    $parent = $parentPath;
+                }
+            }
+
+            return [
+                'root_path' => $navigationRoot,
+                'home_root_path' => $root,
+                'current_path' => $path,
+                'parent_path' => $parent,
+                'read_only' => $this->isReadOnlySystemPath(
+                    $path,
+                    $root,
+                    $allowedRoots
+                ),
+                'access_mode' => $this->isReadOnlySystemPath(
+                    $path,
+                    $root,
+                    $allowedRoots
+                ) ? 'read_only' : 'read_write',
+                'items' => $files,
+                'total_items' => count($files),
+            ];
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+    /**
+     * Mendeteksi disk, partisi, filesystem, mount point, dan perangkat USB.
+     * Perintah remote bersifat tetap dan tidak menerima input pengguna.
+     */
+    /**
+     * Mount partisi filesystem yang sudah ada ke direktori khusus.
+     * Tidak membuat filesystem, partisi, atau mengubah fstab.
+     */
+    public function mountStoragePartition(
+        ManagedServer $server,
+        string $devicePath
+    ): array {
+        if (!preg_match('/\A\/dev\/[A-Za-z0-9._-]+\z/D', $devicePath)) {
+            throw new RuntimeException('Path partisi tidak valid.');
+        }
+
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $run = function (string $command) use ($sftp): string {
+                $output = $sftp->exec($command);
+                $timedOut = $sftp->isTimeout();
+                $status = $sftp->getExitStatus();
+
+                if ($timedOut || $output === false || $status === false) {
+                    throw new RuntimeException('Status operasi remote tidak dapat dipastikan. Periksa kondisi mount sebelum mencoba lagi.');
+                }
+
+                if ($status !== 0 || !is_string($output)) {
+                    throw new RuntimeException('Pemeriksaan atau operasi mount remote gagal.');
+                }
+
+                return trim($output);
+            };
+
+            if ($run('id -u') !== '0') {
+                throw new RuntimeException('Mount memerlukan akun SSH root pada server remote.');
+            }
+
+            $canonical = $run('readlink -f -- ' . escapeshellarg($devicePath));
+            if (
+                $canonical !== $devicePath ||
+                $run('test -b ' . escapeshellarg($devicePath) . ' && printf yes') !== 'yes'
+            ) {
+                throw new RuntimeException('Partisi tidak ditemukan atau bukan block device yang valid.');
+            }
+
+            $json = $run(
+                'LC_ALL=C lsblk --json --output PATH,TYPE,FSTYPE,UUID,RO,MOUNTPOINTS -- '
+                . escapeshellarg($devicePath)
+            );
+            $data = json_decode($json, true);
+            $device = $data['blockdevices'][0] ?? null;
+
+            if (!is_array($device) || ($device['path'] ?? '') !== $devicePath || ($device['type'] ?? '') !== 'part') {
+                throw new RuntimeException('Hanya partisi yang dapat di-mount melalui fitur ini.');
+            }
+
+            $filesystem = strtolower((string) ($device['fstype'] ?? ''));
+            if (!in_array($filesystem, ['ext2', 'ext3', 'ext4', 'xfs', 'btrfs'], true)) {
+                throw new RuntimeException('Filesystem tidak dikenal atau belum didukung. Mount dibatalkan.');
+            }
+
+            $uuid = trim((string) ($device['uuid'] ?? ''));
+            if ($uuid === '' || !preg_match('/\A[A-Za-z0-9._:-]+\z/D', $uuid)) {
+                throw new RuntimeException('UUID partisi tidak valid. Mount dibatalkan.');
+            }
+
+            if (!empty($device['ro'])) {
+                throw new RuntimeException('Partisi dalam kondisi read-only.');
+            }
+
+            $mountpoints = $device['mountpoints'] ?? [];
+            if (
+                (is_string($mountpoints) && $mountpoints !== '') ||
+                (is_array($mountpoints) && count(array_filter($mountpoints)) > 0)
+            ) {
+                throw new RuntimeException('Partisi sudah memiliki mount point.');
+            }
+
+            $rootSource = $run('findmnt --noheadings --raw --output SOURCE --target /');
+            if (!str_starts_with($rootSource, '/dev/')) {
+                throw new RuntimeException('Sumber filesystem root tidak dapat diverifikasi.');
+            }
+
+            $rootTree = preg_split(
+                '/\R/',
+                $run('lsblk -s -nrpo PATH -- ' . escapeshellarg($rootSource))
+            ) ?: [];
+
+            if (in_array($devicePath, $rootTree, true)) {
+                throw new RuntimeException('Partisi merupakan bagian dari filesystem sistem.');
+            }
+
+            $mountRoot = '/mnt/rahanpas-storage';
+            $target = $mountRoot . '/' . $uuid;
+
+            $run('test ! -L ' . escapeshellarg($mountRoot) . ' || exit 1');
+            $run('install -d -m 0755 -- ' . escapeshellarg($mountRoot));
+
+            if ($run('readlink -f -- ' . escapeshellarg($mountRoot)) !== $mountRoot) {
+                throw new RuntimeException('Direktori mount root tidak aman.');
+            }
+
+            $run('test ! -L ' . escapeshellarg($target) . ' || exit 1');
+
+            if ($run('test -e ' . escapeshellarg($target) . ' && printf exists || printf absent') === 'exists') {
+                if ($run('test -d ' . escapeshellarg($target) . ' && printf yes || printf no') !== 'yes') {
+                    throw new RuntimeException('Target mount sudah ada tetapi bukan direktori.');
+                }
+
+                $contents = $run(
+                    'find ' . escapeshellarg($target)
+                    . ' -mindepth 1 -maxdepth 1 -print -quit'
+                );
+
+                if ($contents !== '') {
+                    throw new RuntimeException('Direktori target mount tidak kosong.');
+                }
+            } else {
+                $run('mkdir -- ' . escapeshellarg($target));
+            }
+
+            $run(
+                '/usr/bin/mount -o nosuid,nodev -- '
+                . escapeshellarg($devicePath) . ' '
+                . escapeshellarg($target)
+            );
+
+            $mountedTarget = $run(
+                'findmnt --noheadings --raw --output TARGET --mountpoint '
+                . escapeshellarg($target)
+            );
+            $mountedSource = $run(
+                'findmnt --noheadings --raw --output SOURCE --mountpoint '
+                . escapeshellarg($target)
+            );
+            $resolvedSource = $run(
+                'readlink -f -- ' . escapeshellarg($mountedSource)
+            );
+
+            if ($mountedTarget !== $target || $resolvedSource !== $devicePath) {
+                throw new RuntimeException('Mount berjalan tetapi verifikasi sumber dan target tidak cocok. Periksa status mount sebelum tindakan berikutnya.');
+            }
+
+            return [
+                'device_path' => $devicePath,
+                'uuid' => $uuid,
+                'mountpoint' => $target,
+                'filesystem' => $filesystem,
+                'status' => 'mounted',
+                'completed_at' => now()->toISOString(),
+            ];
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+    /**
+     * Unmount hanya mount point yang dikelola fitur RAHANPAS.
+     * Tidak menggunakan lazy atau force unmount.
+     */
+    public function unmountStoragePartition(
+        ManagedServer $server,
+        string $devicePath
+    ): array {
+        if (!preg_match('/\A\/dev\/[A-Za-z0-9._-]+\z/D', $devicePath)) {
+            throw new RuntimeException('Path partisi tidak valid.');
+        }
+
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $run = function (string $command) use ($sftp): string {
+                $output = $sftp->exec($command);
+                $timedOut = $sftp->isTimeout();
+                $status = $sftp->getExitStatus();
+
+                if ($timedOut || $output === false || $status === false) {
+                    throw new RuntimeException('Status operasi remote tidak dapat dipastikan. Periksa kondisi mount sebelum mencoba lagi.');
+                }
+
+                if ($status !== 0 || !is_string($output)) {
+                    throw new RuntimeException('Pemeriksaan atau operasi unmount remote gagal.');
+                }
+
+                return trim($output);
+            };
+
+            if ($run('id -u') !== '0') {
+                throw new RuntimeException('Unmount memerlukan akun SSH root pada server remote.');
+            }
+
+            $canonical = $run('readlink -f -- ' . escapeshellarg($devicePath));
+            if (
+                $canonical !== $devicePath ||
+                $run('test -b ' . escapeshellarg($devicePath) . ' && printf yes') !== 'yes'
+            ) {
+                throw new RuntimeException('Partisi tidak ditemukan atau bukan block device yang valid.');
+            }
+
+            $uuid = $run(
+                'blkid -s UUID -o value -- ' . escapeshellarg($devicePath)
+            );
+
+            if ($uuid === '' || !preg_match('/\A[A-Za-z0-9._:-]+\z/D', $uuid)) {
+                throw new RuntimeException('UUID partisi tidak valid.');
+            }
+
+            $mountRoot = '/mnt/rahanpas-storage';
+            $target = $mountRoot . '/' . $uuid;
+
+            if (
+                $run('test ! -L ' . escapeshellarg($mountRoot) . ' && printf yes') !== 'yes' ||
+                $run('readlink -f -- ' . escapeshellarg($mountRoot)) !== $mountRoot ||
+                $run('test ! -L ' . escapeshellarg($target) . ' && printf yes') !== 'yes'
+            ) {
+                throw new RuntimeException('Mount point tidak berada pada direktori pengelolaan RAHANPAS yang aman.');
+            }
+
+            $mountedTarget = $run(
+                'findmnt --noheadings --raw --output TARGET --mountpoint '
+                . escapeshellarg($target)
+            );
+
+            if ($mountedTarget !== $target) {
+                throw new RuntimeException('Partisi tidak sedang ter-mount pada mount point RAHANPAS.');
+            }
+
+            $mountedSource = $run(
+                'findmnt --noheadings --raw --output SOURCE --mountpoint '
+                . escapeshellarg($target)
+            );
+            $resolvedSource = $run(
+                'readlink -f -- ' . escapeshellarg($mountedSource)
+            );
+
+            if ($resolvedSource !== $devicePath) {
+                throw new RuntimeException('Sumber mount tidak cocok dengan partisi yang diminta.');
+            }
+
+            $mountTree = preg_split(
+                '/\R/',
+                $run('findmnt -R -n -o TARGET -- ' . escapeshellarg($target))
+            ) ?: [];
+
+            if (count(array_filter($mountTree)) > 1) {
+                throw new RuntimeException('Terdapat mount turunan di dalam direktori ini. Unmount dibatalkan.');
+            }
+
+            $run('/usr/bin/umount -- ' . escapeshellarg($target));
+
+            if ($run('mountpoint -q -- ' . escapeshellarg($target) . ' && printf mounted || printf unmounted') !== 'unmounted') {
+                throw new RuntimeException('Verifikasi unmount gagal.');
+            }
+
+            return [
+                'device_path' => $devicePath,
+                'uuid' => $uuid,
+                'mountpoint' => $target,
+                'status' => 'unmounted',
+                'completed_at' => now()->toISOString(),
+            ];
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+    public function getStorageDevices(ManagedServer $server): array
+    {
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $lsblkOutput = $sftp->exec(
+                'LC_ALL=C lsblk -J -o NAME,KNAME,PATH,TYPE,SIZE,FSTYPE,LABEL,UUID,MOUNTPOINT,TRAN,RM,RO,MODEL 2>/dev/null'
+            );
+
+            if (!is_string($lsblkOutput) || trim($lsblkOutput) === '') {
+                throw new RuntimeException(
+                    'Gagal membaca informasi perangkat storage. Pastikan utilitas lsblk tersedia.'
+                );
+            }
+
+            $blockDevices = json_decode($lsblkOutput, true);
+
+            if (!is_array($blockDevices) || !isset($blockDevices['blockdevices'])) {
+                throw new RuntimeException('Format informasi block device dari server tidak valid.');
+            }
+
+            $mountOutput = $sftp->exec(
+                'LC_ALL=C findmnt --json --output SOURCE,TARGET,FSTYPE,OPTIONS 2>/dev/null'
+            );
+
+            $mounts = [];
+
+            if (is_string($mountOutput) && trim($mountOutput) !== '') {
+                $mountData = json_decode($mountOutput, true);
+
+                if (is_array($mountData)) {
+                    $mounts = $mountData['filesystems'] ?? [];
+                }
+            }
+
+            $allowedMountpoints = $this->allowedStorageMountRoots(
+                $sftp,
+                $connection['root']
+            );
+
+            $dfOutput = $sftp->exec('LC_ALL=C df -B1 -P 2>/dev/null');
+            $usageByMount = [];
+            $usageBySource = [];
+
+            $formatSize = static function (float $bytes): string {
+                if ($bytes >= 1099511627776) {
+                    return number_format($bytes / 1099511627776, 2) . ' TB';
+                }
+                if ($bytes >= 1073741824) {
+                    return number_format($bytes / 1073741824, 2) . ' GB';
+                }
+                return number_format($bytes / 1048576, 2) . ' MB';
+            };
+
+            if (is_string($dfOutput) && trim($dfOutput) !== '') {
+                $lines = preg_split('/\r?\n/', trim($dfOutput));
+                foreach (array_slice($lines ?: [], 1) as $line) {
+                    $cols = preg_split('/\s+/', trim($line), 6);
+                    if (!$cols || count($cols) < 6) {
+                        continue;
+                    }
+                    $total = (float) $cols[1];
+                    $used = (float) $cols[2];
+                    $pct = $total > 0 ? round(($used / $total) * 100, 1) : 0.0;
+                    $info = [
+                        'used_bytes' => (int) $used,
+                        'total_bytes' => (int) $total,
+                        'usage_percent' => $pct,
+                        'usage_summary' => $formatSize($used) . ' / ' . $formatSize($total),
+                    ];
+                    $usageByMount[$cols[5]] = $info;
+                    $usageBySource[$cols[0]] = $info;
+                }
+            }
+
+            $attachUsage = static function (array $node) use (&$attachUsage, $usageByMount, $usageBySource): array {
+                $mp = $node['mountpoint'] ?? null;
+                $src = $node['path'] ?? null;
+                $match = ($mp && isset($usageByMount[$mp]))
+                    ? $usageByMount[$mp]
+                    : (($src && isset($usageBySource[$src])) ? $usageBySource[$src] : null);
+
+                if ($match) {
+                    $node = array_merge($node, $match);
+                }
+
+                if (!empty($node['children']) && is_array($node['children'])) {
+                    $node['children'] = array_map($attachUsage, $node['children']);
+                }
+
+                return $node;
+            };
+
+            $devices = array_map($attachUsage, $blockDevices['blockdevices']);
+
+            return [
+                'devices' => $devices,
+                'mounts' => $mounts,
+                'explorable_mountpoints' => $allowedMountpoints,
+                'detected_at' => now()->toISOString(),
+            ];
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+
+
+    /**
+     * Pemeriksaan read-only sebelum disk diizinkan untuk diformat.
+     */
+    public function inspectStorageDeviceFormat(
+        ManagedServer $server,
+        string $devicePath
+    ): array {
+        if (!preg_match('/^\/dev\/[A-Za-z0-9._-]+$/D', $devicePath)) {
+            throw new RuntimeException('Path perangkat disk tidak valid.');
+        }
+
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $run = function (string $command) use ($sftp): string {
+                $output = $sftp->exec($command);
+                $status = $sftp->getExitStatus();
+
+                if ($status !== 0) {
+                    throw new RuntimeException(
+                        'Pemeriksaan disk remote gagal dijalankan.'
+                    );
+                }
+
+                return is_string($output) ? trim($output) : '';
+            };
+
+            if ($run('id -u') !== '0') {
+                throw new RuntimeException(
+                    'Pemeriksaan dan format disk memerlukan akun SSH root.'
+                );
+            }
+
+            $canonicalPath = $run(
+                'readlink -f -- ' . escapeshellarg($devicePath)
+            );
+
+            if (
+                $canonicalPath !== $devicePath ||
+                $run('test -b ' . escapeshellarg($devicePath) . ' && printf yes') !== 'yes'
+            ) {
+                throw new RuntimeException(
+                    'Perangkat tidak ditemukan atau bukan block device yang valid.'
+                );
+            }
+
+            $diskJson = $run(
+                'LC_ALL=C lsblk --json --tree --bytes '
+                . '--output PATH,TYPE,SIZE,RO,MODEL,SERIAL,WWN,PTTYPE,PARTTYPE,PARTUUID,MOUNTPOINTS '
+                . '-- ' . escapeshellarg($devicePath)
+            );
+
+            $diskData = json_decode($diskJson, true);
+            $devices = $diskData['blockdevices'] ?? [];
+
+            if (
+                !is_array($devices) ||
+                count($devices) !== 1 ||
+                !is_array($devices[0])
+            ) {
+                throw new RuntimeException(
+                    'Informasi perangkat disk tidak dapat diverifikasi.'
+                );
+            }
+
+            $disk = $devices[0];
+
+            if (
+                ($disk['path'] ?? null) !== $devicePath ||
+                ($disk['type'] ?? null) !== 'disk'
+            ) {
+                throw new RuntimeException(
+                    'Hanya perangkat disk utuh yang dapat diperiksa.'
+                );
+            }
+
+            $reasons = [];
+
+            if (!empty($disk['ro'])) {
+                $reasons[] = 'Perangkat berada dalam kondisi read-only.';
+            }
+
+            if (!empty($disk['children'])) {
+                $reasons[] = 'Perangkat sudah memiliki partisi atau perangkat turunan.';
+            }
+
+            $checkMounts = function (array $node) use (&$checkMounts): bool {
+                $mountpoints = $node['mountpoints'] ?? null;
+
+                if (is_string($mountpoints) && $mountpoints !== '') {
+                    return true;
+                }
+
+                if (is_array($mountpoints)) {
+                    foreach ($mountpoints as $mountpoint) {
+                        if (is_string($mountpoint) && $mountpoint !== '') {
+                            return true;
+                        }
+                    }
+                }
+
+                foreach (($node['children'] ?? []) as $child) {
+                    if (is_array($child) && $checkMounts($child)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            };
+
+            if ($checkMounts($disk)) {
+                $reasons[] = 'Perangkat atau turunannya memiliki mountpoint.';
+            }
+
+            $rootSource = $run(
+                'findmnt --noheadings --raw --output SOURCE --target /'
+            );
+
+            if (!str_starts_with($rootSource, '/dev/')) {
+                $reasons[] = 'Disk sistem tidak dapat diidentifikasi dengan aman.';
+            } else {
+                $rootTree = $run(
+                    'lsblk -s -nrpo PATH -- ' . escapeshellarg($rootSource)
+                );
+
+                $rootDevices = preg_split('/\R/', $rootTree) ?: [];
+
+                if (in_array($devicePath, $rootDevices, true)) {
+                    $reasons[] = 'Perangkat merupakan bagian dari disk sistem.';
+                }
+            }
+
+            $swapOutput = $run('cat /proc/swaps');
+            $swapLines = preg_split('/\R/', $swapOutput) ?: [];
+
+            foreach (array_slice($swapLines, 1) as $line) {
+                $columns = preg_split('/\s+/', trim($line));
+
+                if (
+                    !is_array($columns) ||
+                    empty($columns[0]) ||
+                    !str_starts_with($columns[0], '/dev/')
+                ) {
+                    continue;
+                }
+
+                $swapTree = $run(
+                    'lsblk -s -nrpo PATH -- ' . escapeshellarg($columns[0])
+                );
+
+                $swapDevices = preg_split('/\R/', $swapTree) ?: [];
+
+                if (in_array($devicePath, $swapDevices, true)) {
+                    $reasons[] = 'Perangkat digunakan sebagai swap.';
+                    break;
+                }
+            }
+
+            $deviceName = basename($devicePath);
+
+            $holders = $run(
+                'find /sys/class/block/' . escapeshellarg($deviceName)
+                . '/holders -mindepth 1 -maxdepth 1 -printf "%f\\n" 2>/dev/null'
+            );
+
+            $slaves = $run(
+                'find /sys/class/block/' . escapeshellarg($deviceName)
+                . '/slaves -mindepth 1 -maxdepth 1 -printf "%f\\n" 2>/dev/null'
+            );
+
+            if ($holders !== '') {
+                $reasons[] = 'Perangkat sedang digunakan oleh device holder.';
+            }
+
+            if ($slaves !== '') {
+                $reasons[] = 'Perangkat memiliki device slave.';
+            }
+
+            $signatures = $run(
+                'LC_ALL=C wipefs --no-act --noheadings --output TYPE -- '
+                . escapeshellarg($devicePath)
+            );
+
+            if ($signatures !== '') {
+                $reasons[] = 'Ditemukan signature filesystem atau partition table.';
+            }
+
+            $diskSequence = $run(
+                'cat /sys/class/block/' . escapeshellarg($deviceName) . '/diskseq'
+            );
+
+            $sizeBytes = (string) ($disk['size'] ?? '');
+
+            if (
+                !ctype_digit($sizeBytes) ||
+                ltrim($sizeBytes, '0') === ''
+            ) {
+                $reasons[] = 'Ukuran perangkat tidak dapat diverifikasi.';
+            }
+
+            if (
+                !ctype_digit($diskSequence) ||
+                ltrim($diskSequence, '0') === ''
+            ) {
+                $reasons[] = 'Identitas diskseq tidak dapat diverifikasi.';
+            }
+
+            $filesystems = [];
+
+            foreach ([
+                'ext4' => '/usr/sbin/mkfs.ext4',
+                'xfs' => '/usr/sbin/mkfs.xfs',
+                'btrfs' => '/usr/sbin/mkfs.btrfs',
+            ] as $filesystem => $binary) {
+                $check = $sftp->exec(
+                    'test -x ' . escapeshellarg($binary) . ' && printf yes'
+                );
+                $status = $sftp->getExitStatus();
+
+                if ($status === 0 && trim((string) $check) === 'yes') {
+                    $filesystems[] = $filesystem;
+                }
+            }
+
+            if ($filesystems === []) {
+                $reasons[] = 'Tidak ada utilitas filesystem yang didukung.';
+            }
+
+            $identity = [
+                'path' => $devicePath,
+                'size_bytes' => $sizeBytes,
+                'model' => (string) ($disk['model'] ?? ''),
+                'serial' => (string) ($disk['serial'] ?? ''),
+                'wwn' => (string) ($disk['wwn'] ?? ''),
+                'diskseq' => $diskSequence,
+            ];
+
+            $fingerprint = hash(
+                'sha256',
+                json_encode($identity, JSON_UNESCAPED_SLASHES)
+            );
+
+            return [
+                'device' => $identity,
+                'fingerprint' => $fingerprint,
+                'eligible' => $reasons === [],
+                'reasons' => array_values(array_unique($reasons)),
+                'supported_filesystems' => $filesystems,
+                'checked_at' => now()->toISOString(),
+            ];
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+    /**
+     * Inisialisasi disk kosong dengan GPT, satu partisi, dan filesystem.
+     * Pemeriksaan preflight dan fingerprint selalu diulang sebelum penulisan.
+     */
+    public function formatStorageDevice(
+        ManagedServer $server,
+        string $devicePath,
+        string $expectedFingerprint,
+        string $filesystem,
+        string $label,
+        string $confirmation
+    ): array {
+        if (
+            !preg_match('/^\/dev\/[A-Za-z0-9._-]+$/D', $devicePath) ||
+            !hash_equals($devicePath, $confirmation)
+        ) {
+            throw new RuntimeException('Konfirmasi atau path perangkat tidak valid.');
+        }
+
+        if (!preg_match('/^[a-f0-9]{64}$/D', $expectedFingerprint)) {
+            throw new RuntimeException('Fingerprint perangkat tidak valid.');
+        }
+
+        if (!in_array($filesystem, ['ext4', 'xfs', 'btrfs'], true)) {
+            throw new RuntimeException('Filesystem tidak didukung.');
+        }
+
+        if (
+            strlen($label) > 12 ||
+            ($label !== '' && !preg_match('/^[A-Za-z0-9._-]+$/D', $label))
+        ) {
+            throw new RuntimeException('Label filesystem tidak valid. Gunakan maksimal 12 karakter.');
+        }
+
+        $deviceName = basename($devicePath);
+        $lockDirectory = '/run/lock/rahanpas-storage-format';
+        $lockPath = $lockDirectory . '/' . hash('sha256', $devicePath);
+        $lockHeld = false;
+        $sftp = null;
+        $stage = 'preflight';
+
+        $connection = $this->connect($server);
+        $sftp = $connection['sftp'];
+        $sftp->setTimeout(self::FORMAT_COMMAND_TIMEOUT);
+
+        try {
+            $run = function (string $command) use ($sftp): string {
+                $output = $sftp->exec($command);
+                $timedOut = $sftp->isTimeout();
+                $status = $sftp->getExitStatus();
+
+                if ($timedOut || $output === false || $status === false) {
+                    throw new RuntimeException(
+                        'Hasil perintah remote tidak dapat dipastikan (koneksi terputus atau timeout). Jangan ulangi operasi; periksa kondisi disk terlebih dahulu.'
+                    );
+                }
+
+                if ($status !== 0 || !is_string($output)) {
+                    throw new RuntimeException(
+                        'Perintah remote gagal. Periksa kondisi disk sebelum mencoba kembali.'
+                    );
+                }
+
+                return trim($output);
+            };
+
+            if ($run('id -u') !== '0') {
+                throw new RuntimeException('Format disk memerlukan akun SSH root.');
+            }
+
+            $run(
+                'install -d -m 0700 -- ' . escapeshellarg($lockDirectory)
+            );
+
+            $lockResult = $sftp->exec(
+                'mkdir -- ' . escapeshellarg($lockPath) . ' 2>/dev/null && printf acquired'
+            );
+            $lockTimedOut = $sftp->isTimeout();
+            $lockStatus = $sftp->getExitStatus();
+
+            if (
+                $lockTimedOut ||
+                $lockResult === false ||
+                $lockStatus === false ||
+                $lockStatus !== 0 ||
+                !is_string($lockResult) ||
+                trim($lockResult) !== 'acquired'
+            ) {
+                throw new RuntimeException(
+                    'Perangkat sedang diproses oleh operasi lain. Coba lagi setelah proses selesai.'
+                );
+            }
+
+            $lockHeld = true;
+
+            $stage = 'preflight';
+            $preflight = $this->inspectStorageDeviceFormat($server, $devicePath);
+
+            if (
+                empty($preflight['eligible']) ||
+                !hash_equals($expectedFingerprint, (string) ($preflight['fingerprint'] ?? ''))
+            ) {
+                throw new RuntimeException(
+                    'Identitas atau kondisi disk berubah sejak pemeriksaan awal. Format dibatalkan; lakukan pemeriksaan ulang.'
+                );
+            }
+
+            if (!in_array($filesystem, $preflight['supported_filesystems'] ?? [], true)) {
+                throw new RuntimeException('Utilitas filesystem tidak tersedia pada server remote.');
+            }
+
+            $stage = 'partition_table';
+
+            $run(
+                '/usr/sbin/sgdisk --clear --new=1:0:0 --typecode=1:8300 '
+                . '--change-name=1:' . escapeshellarg('DATA')
+                . ' -- ' . escapeshellarg($devicePath)
+            );
+
+            $stage = 'partition_rescan';
+
+            $run(
+                '/usr/sbin/partprobe -- ' . escapeshellarg($devicePath)
+            );
+
+            $run(
+                '/usr/bin/udevadm settle --timeout=15'
+            );
+
+            $partitionPath = $devicePath . '1';
+
+            if (preg_match('/[0-9]$/', $devicePath)) {
+                $partitionPath = $devicePath . 'p1';
+            }
+
+            $partitionPath = $run(
+                'readlink -f -- ' . escapeshellarg($partitionPath)
+            );
+
+            if (
+                !preg_match('/^\/dev\/[A-Za-z0-9._-]+$/D', $partitionPath) ||
+                $run('test -b ' . escapeshellarg($partitionPath) . ' && printf yes') !== 'yes'
+            ) {
+                throw new RuntimeException('Partisi GPT belum dapat diverifikasi oleh kernel.');
+            }
+
+            $parent = $run(
+                '/usr/bin/lsblk -dnro PKNAME -- ' . escapeshellarg($partitionPath)
+            );
+
+            if ($parent !== $deviceName) {
+                throw new RuntimeException('Partisi yang terdeteksi tidak cocok dengan disk target.');
+            }
+
+            $stage = 'filesystem';
+
+            $filesystemCommands = [
+                'ext4' => '/usr/sbin/mkfs.ext4 -F',
+                'xfs' => '/usr/sbin/mkfs.xfs -f',
+                'btrfs' => '/usr/sbin/mkfs.btrfs -f',
+            ];
+
+            $command = $filesystemCommands[$filesystem]
+                . ($label !== '' ? ' -L ' . escapeshellarg($label) : '')
+                . ' -- ' . escapeshellarg($partitionPath);
+
+            $run($command);
+
+            $stage = 'verification';
+
+            $verifiedType = strtolower($run(
+                '/usr/sbin/blkid -p -s TYPE -o value -- '
+                . escapeshellarg($partitionPath)
+            ));
+
+            if ($verifiedType !== $filesystem) {
+                throw new RuntimeException(
+                    'Filesystem selesai dibuat tetapi verifikasi tipe filesystem tidak cocok.'
+                );
+            }
+
+            $verifiedLabel = $label === ''
+                ? ''
+                : $run(
+                    '/usr/sbin/blkid -p -s LABEL -o value -- '
+                    . escapeshellarg($partitionPath)
+                );
+
+            if ($verifiedLabel !== $label) {
+                throw new RuntimeException(
+                    'Filesystem terdeteksi tetapi verifikasi label tidak cocok.'
+                );
+            }
+
+            $stage = 'complete';
+
+            return [
+                'device_path' => $devicePath,
+                'partition_path' => $partitionPath,
+                'partition_table' => 'gpt',
+                'filesystem' => $verifiedType,
+                'label' => $verifiedLabel,
+                'status' => 'completed',
+                'completed_at' => now()->toISOString(),
+            ];
+        } catch (Throwable $exception) {
+            if (in_array($stage, ['partition_table', 'partition_rescan', 'filesystem', 'verification'], true)) {
+                throw new RuntimeException(
+                    'Format gagal pada tahap ' . $stage
+                    . '. Kondisi disk mungkin sudah berubah sebagian. Jangan ulangi format sebelum pemeriksaan ulang. Detail: '
+                    . $exception->getMessage(),
+                    0,
+                    $exception
+                );
+            }
+
+            throw $exception;
+        } finally {
+            if ($lockHeld && $sftp instanceof SFTP && $sftp->isConnected()) {
+                $sftp->exec('rmdir -- ' . escapeshellarg($lockPath) . ' 2>/dev/null || true');
+            }
+
+            if ($sftp instanceof SFTP) {
+                $sftp->disconnect();
+            }
+        }
+    }
+
+    /**
+     * Validasi nama file/folder yang akan dibuat atau digunakan untuk rename.
+     */
+    private function validateExplorerName(string $name): string
+    {
+        if (
+            $name === '' ||
+            $name === '.' ||
+            $name === '..' ||
+            strlen($name) > 255 ||
+            preg_match('/[\/\\\\\x00-\x1F\x7F]/', $name)
+        ) {
+            throw new RuntimeException('Nama file atau folder tidak valid.');
+        }
+
+        return $name;
+    }
+
+    /**
+     * Membuat folder di dalam direktori yang diizinkan.
+     */
+    public function createDirectory(
+        ManagedServer $server,
+        string $requestedDirectory,
+        string $name
+    ): array {
+        $name = $this->validateExplorerName($name);
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $root = $connection['root'];
+            $allowedRoots = $this->allowedStorageMountRoots($sftp, $root);
+            $directory = $this->resolvePath(
+                $sftp,
+                $root,
+                $requestedDirectory,
+                $allowedRoots
+            );
+
+            if ($this->isReadOnlySystemPath($directory, $root, $allowedRoots)) {
+                throw new RuntimeException('Filesystem root OS hanya dapat dibaca. Operasi pembuatan folder ditolak.');
+            }
+
+            if (!$sftp->is_dir($directory)) {
+                throw new RuntimeException('Lokasi pembuatan folder bukan direktori.');
+            }
+
+            $entries = $sftp->rawlist($directory);
+
+            if (!is_array($entries)) {
+                throw new RuntimeException('Gagal membaca direktori tujuan.');
+            }
+
+            if (array_key_exists($name, $entries)) {
+                throw new RuntimeException('Nama tersebut sudah digunakan.');
+            }
+
+            $target = rtrim($directory, '/') . '/' . $name;
+
+            if (!$sftp->mkdir($target, 0755, false)) {
+                throw new RuntimeException('Gagal membuat folder. Periksa permission direktori.');
+            }
+
+            return [
+                'name' => $name,
+                'path' => $target,
+                'type' => 'directory',
+            ];
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+    /**
+     * Rename hanya untuk item langsung di dalam direktori induknya.
+     * Symbolic link dan item khusus ditolak.
+     */
+    public function renameEntry(
+        ManagedServer $server,
+        string $requestedPath,
+        string $newName
+    ): array {
+        $newName = $this->validateExplorerName($newName);
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $root = $connection['root'];
+            $allowedRoots = $this->allowedStorageMountRoots($sftp, $root);
+            $source = $this->resolvePath(
+                $sftp,
+                $root,
+                $requestedPath,
+                $allowedRoots
+            );
+
+            if (
+                $this->isReadOnlySystemPath($source, $root, $allowedRoots) ||
+                $this->isReadOnlySystemPath(dirname($source), $root, $allowedRoots)
+            ) {
+                throw new RuntimeException('Filesystem root OS hanya dapat dibaca. Operasi rename ditolak.');
+            }
+
+            if ($source === $root || in_array($source, $allowedRoots, true)) {
+                throw new RuntimeException('HOME atau mount point utama tidak boleh di-rename.');
+            }
+
+            $parentPath = dirname($source);
+            $parent = $this->resolvePath(
+                $sftp,
+                $root,
+                $parentPath,
+                $allowedRoots
+            );
+
+            if (!$sftp->is_dir($parent)) {
+                throw new RuntimeException('Direktori induk tidak valid.');
+            }
+
+            $entries = $sftp->rawlist($parent);
+            $oldName = basename($source);
+
+            if (!is_array($entries) || !isset($entries[$oldName])) {
+                throw new RuntimeException('Item yang akan di-rename tidak ditemukan.');
+            }
+
+            $entry = $entries[$oldName];
+            $mode = isset($entry['mode']) ? (int) $entry['mode'] : null;
+            $entryType = isset($entry['type']) ? (int) $entry['type'] : null;
+            $unixType = $mode !== null ? ($mode & 0170000) : null;
+
+            if ($entryType === 3 || $unixType === 0120000) {
+                throw new RuntimeException('Rename symbolic link tidak diizinkan.');
+            }
+
+            if (
+                !in_array($entryType, [1, 2], true) &&
+                !in_array($unixType, [0100000, 0040000], true)
+            ) {
+                throw new RuntimeException('Tipe item tidak didukung untuk rename.');
+            }
+
+            if ($newName === $oldName) {
+                return [
+                    'name' => $oldName,
+                    'path' => $source,
+                ];
+            }
+
+            if (array_key_exists($newName, $entries)) {
+                throw new RuntimeException('Nama tujuan sudah digunakan.');
+            }
+
+            $target = rtrim($parent, '/') . '/' . $newName;
+
+            if (!$sftp->rename($source, $target)) {
+                throw new RuntimeException('Gagal rename item. Periksa permission direktori.');
+            }
+
+            return [
+                'name' => $newName,
+                'path' => $target,
+            ];
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+    /**
+     * Menghapus file/folder secara rekursif tanpa mengikuti symbolic link.
+     */
+    private function deleteDirectoryContents(SFTP $sftp, string $directory): void
+    {
+        $entries = $sftp->rawlist($directory);
+
+        if (!is_array($entries)) {
+            throw new RuntimeException('Gagal membaca isi folder untuk dihapus.');
+        }
+
+        foreach ($entries as $name => $entry) {
+            if (
+                !is_string($name) ||
+                $name === '.' ||
+                $name === '..' ||
+                !is_array($entry)
+            ) {
+                continue;
+            }
+
+            $path = rtrim($directory, '/') . '/' . $name;
+            $mode = isset($entry['mode']) ? (int) $entry['mode'] : null;
+            $entryType = isset($entry['type']) ? (int) $entry['type'] : null;
+            $unixType = $mode !== null ? ($mode & 0170000) : null;
+
+            // Symlink dihapus sebagai link, tidak pernah diikuti.
+            if ($entryType === 3 || $unixType === 0120000) {
+                if (!$sftp->delete($path)) {
+                    throw new RuntimeException('Gagal menghapus symbolic link: ' . $name);
+                }
+                continue;
+            }
+
+            if ($entryType === 2 || $unixType === 0040000) {
+                $this->deleteDirectoryContents($sftp, $path);
+
+                if (!$sftp->rmdir($path)) {
+                    throw new RuntimeException('Gagal menghapus subfolder: ' . $name);
+                }
+                continue;
+            }
+
+            if ($entryType === 1 || $unixType === 0100000) {
+                if (!$sftp->delete($path)) {
+                    throw new RuntimeException('Gagal menghapus file: ' . $name);
+                }
+                continue;
+            }
+
+            throw new RuntimeException(
+                'Penghapusan dihentikan karena ditemukan tipe item yang tidak dapat diverifikasi: ' . $name
+            );
+        }
+    }
+
+    /**
+     * Menghapus file atau folder. Folder dihapus beserta seluruh child-nya.
+     * HOME, root, mount root, dan folder yang berisi mount point lain dilindungi.
+     */
+    public function deleteEntry(
+        ManagedServer $server,
+        string $requestedPath
+    ): array {
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        try {
+            $root = $connection['root'];
+            $allowedRoots = $this->allowedStorageMountRoots($sftp, $root);
+            $target = $this->resolvePath(
+                $sftp,
+                $root,
+                $requestedPath,
+                $allowedRoots
+            );
+
+            if (
+                $this->isReadOnlySystemPath($target, $root, $allowedRoots) ||
+                $this->isReadOnlySystemPath(dirname($target), $root, $allowedRoots)
+            ) {
+                throw new RuntimeException('Filesystem root OS hanya dapat dibaca. Operasi penghapusan ditolak.');
+            }
+
+            $protectedRoots = array_merge([$root], $allowedRoots);
+
+            foreach ($protectedRoots as $protectedRoot) {
+                if ($target === $protectedRoot) {
+                    throw new RuntimeException('HOME dan mount point utama tidak boleh dihapus.');
+                }
+            }
+
+            // Jangan sampai penghapusan parent menyentuh filesystem mount lain.
+            foreach ($allowedRoots as $mountRoot) {
+                if (
+                    $mountRoot !== $target &&
+                    $this->isPathWithinRoot($mountRoot, $target)
+                ) {
+                    throw new RuntimeException(
+                        'Folder berisi mount point lain. Lepaskan atau kelola mount tersebut secara terpisah sebelum menghapus folder ini.'
+                    );
+                }
+            }
+
+            $parent = dirname($target);
+            $parentResolved = $this->resolvePath(
+                $sftp,
+                $root,
+                $parent,
+                $allowedRoots
+            );
+
+            if ($parentResolved !== $parent) {
+                throw new RuntimeException('Direktori induk item tidak valid.');
+            }
+
+            $name = basename($target);
+            $entries = $sftp->rawlist($parent);
+
+            if (!is_array($entries) || !isset($entries[$name])) {
+                throw new RuntimeException('Item yang akan dihapus tidak ditemukan.');
+            }
+
+            $entry = $entries[$name];
+            $mode = isset($entry['mode']) ? (int) $entry['mode'] : null;
+            $entryType = isset($entry['type']) ? (int) $entry['type'] : null;
+            $unixType = $mode !== null ? ($mode & 0170000) : null;
+
+            if ($entryType === 3 || $unixType === 0120000) {
+                if (!$sftp->delete($target)) {
+                    throw new RuntimeException('Gagal menghapus symbolic link.');
+                }
+
+                return ['path' => $target, 'type' => 'symlink'];
+            }
+
+            if ($entryType === 2 || $unixType === 0040000) {
+                $this->deleteDirectoryContents($sftp, $target);
+
+                if (!$sftp->rmdir($target)) {
+                    throw new RuntimeException('Gagal menghapus folder. Periksa permission dan isi folder.');
+                }
+
+                return ['path' => $target, 'type' => 'directory'];
+            }
+
+            if ($entryType === 1 || $unixType === 0100000) {
+                if (!$sftp->delete($target)) {
+                    throw new RuntimeException('Gagal menghapus file. Periksa permission file.');
+                }
+
+                return ['path' => $target, 'type' => 'file'];
+            }
+
+            throw new RuntimeException('Tipe item tidak didukung untuk dihapus.');
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+    /**
+     * Upload file lokal ke server remote melalui SFTP.
+     * File dipublikasikan menggunakan hard link agar nama tujuan
+     * tidak dapat menimpa file yang sudah ada.
+     */
+    public function uploadFile(
+        ManagedServer $server,
+        string $localPath,
+        string $filename,
+        ?string $requestedDirectory = null
+    ): array {
+        if (
+            $filename === '' ||
+            $filename === '.' ||
+            $filename === '..' ||
+            strlen($filename) > 255 ||
+            preg_match('/[\/\\\\\x00-\x1F\x7F]/', $filename)
+        ) {
+            throw new RuntimeException('Nama file tidak valid.');
+        }
+
+        if (!is_file($localPath) || !is_readable($localPath)) {
+            throw new RuntimeException('File upload sementara tidak tersedia atau tidak dapat dibaca.');
+        }
+
+        $fileSize = filesize($localPath);
+
+        if ($fileSize === false || $fileSize > 100 * 1024 * 1024) {
+            throw new RuntimeException('Ukuran file melebihi batas upload 100 MB.');
+        }
+
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        $temporaryPath = null;
+
+        try {
+            $root = $connection['root'];
+            $allowedRoots = $this->allowedStorageMountRoots($sftp, $root);
+            $directory = $this->resolvePath(
+                $sftp,
+                $root,
+                $requestedDirectory,
+                $allowedRoots
+            );
+
+            if ($this->isReadOnlySystemPath($directory, $root, $allowedRoots)) {
+                throw new RuntimeException('Filesystem root OS hanya dapat dibaca. Upload ditolak.');
+            }
+
+            if (!$sftp->is_dir($directory)) {
+                throw new RuntimeException('Direktori tujuan upload tidak valid.');
+            }
+
+            $entries = $sftp->rawlist($directory);
+
+            if (!is_array($entries)) {
+                throw new RuntimeException('Gagal membaca direktori tujuan upload.');
+            }
+
+            if (array_key_exists($filename, $entries)) {
+                throw new RuntimeException('File dengan nama tersebut sudah ada. Upload dibatalkan agar file lama tidak tertimpa.');
+            }
+
+            $targetPath = rtrim($directory, '/') . '/' . $filename;
+
+            // Nama sementara acak dan berada di direktori yang sama.
+            $temporaryName = '.rahanpas-upload-' . bin2hex(random_bytes(16));
+            $temporaryPath = rtrim($directory, '/') . '/' . $temporaryName;
+
+            if (array_key_exists($temporaryName, $entries)) {
+                throw new RuntimeException('Gagal membuat nama file sementara yang unik.');
+            }
+
+            // SOURCE_LOCAL_FILE membuat phpseclib membaca file per chunk.
+            if (!$sftp->put(
+                $temporaryPath,
+                $localPath,
+                SFTP::SOURCE_LOCAL_FILE
+            )) {
+                throw new RuntimeException('Transfer file ke server remote gagal.');
+            }
+
+            // Hard link bersifat no-clobber: gagal jika target sudah ada.
+            $command = '/usr/bin/ln -T -- '
+                . escapeshellarg($temporaryPath)
+                . ' '
+                . escapeshellarg($targetPath)
+                . ' 2>/dev/null';
+
+            $sftp->exec($command);
+            $exitStatus = $sftp->getExitStatus();
+
+            if ($exitStatus !== 0) {
+                throw new RuntimeException(
+                    'Gagal memublikasikan file. Nama tujuan mungkin sudah digunakan atau filesystem tidak mendukung hard link.'
+                );
+            }
+
+            return [
+                'name' => $filename,
+                'path' => $targetPath,
+                'size' => $fileSize,
+                'uploaded_at' => now()->toISOString(),
+            ];
+        } finally {
+            // Menghapus nama sementara; hard link final tetap utuh.
+            if ($temporaryPath !== null) {
+                try {
+                    // Tetap bersihkan file parsial jika put() gagal.
+                    $sftp->delete($temporaryPath);
+                } catch (Throwable) {
+                    // Jangan menutupi exception utama akibat kegagalan transfer.
+                }
+            }
+
+            $sftp->disconnect();
+        }
+    }
+
+    /**
+     * Mengunduh file remote ke temporary file lokal secara streaming.
+     * Controller bertanggung jawab menghapus temporary file setelah
+     * respons HTTP selesai dikirim.
+     */
+    public function prepareDownload(
+        ManagedServer $server,
+        string $requestedPath
+    ): array {
+        $connection = $this->connect($server);
+        /** @var SFTP $sftp */
+        $sftp = $connection['sftp'];
+
+        $localPath = null;
+
+        try {
+            $root = $connection['root'];
+            $allowedRoots = $this->allowedStorageMountRoots($sftp, $root);
+            $remotePath = $this->resolvePath(
+                $sftp,
+                $root,
+                $requestedPath,
+                $allowedRoots
+            );
+
+            if ($this->isReadOnlySystemPath($remotePath, $root, $allowedRoots)) {
+                throw new RuntimeException('Download dari filesystem root OS dinonaktifkan.');
+            }
+
+            if (!$sftp->is_file($remotePath)) {
+                throw new RuntimeException('Path yang diminta bukan file reguler.');
+            }
+
+            $attributes = $sftp->stat($remotePath);
+
+            if (!is_array($attributes) || !isset($attributes['size'])) {
+                throw new RuntimeException('Gagal membaca ukuran file remote.');
+            }
+
+            $localPath = tempnam(
+                sys_get_temp_dir(),
+                'rahanpas-download-'
+            );
+
+            if ($localPath === false) {
+                throw new RuntimeException('Gagal membuat temporary file untuk download.');
+            }
+
+            // Memberi izin baca hanya kepada pemilik proses PHP.
+            @chmod($localPath, 0600);
+
+            // Jika argumen kedua berupa path lokal, phpseclib menulis
+            // data bertahap ke disk, bukan mengembalikan seluruh isi file.
+            if (!$sftp->get($remotePath, $localPath)) {
+                throw new RuntimeException('Gagal mengambil file dari server remote.');
+            }
+
+            $downloadedSize = filesize($localPath);
+
+            if (
+                $downloadedSize === false ||
+                $downloadedSize !== (int) $attributes['size']
+            ) {
+                throw new RuntimeException(
+                    'Ukuran file berubah atau tidak konsisten selama proses download.'
+                );
+            }
+
+            return [
+                'local_path' => $localPath,
+                'filename' => basename($remotePath),
+                'size' => (int) $attributes['size'],
+            ];
+        } catch (\Throwable $exception) {
+            if ($localPath !== null && is_file($localPath)) {
+                @unlink($localPath);
+            }
+
+            throw $exception;
+        } finally {
+            $sftp->disconnect();
+        }
+    }
+
+}

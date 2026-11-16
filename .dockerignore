@@ -1,0 +1,22 @@
+.git
+.env
+.env.*
+!.env.example
+**/vendor
+**/node_modules
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+database/*.sqlite
+database/*.sqlite-*
+deploy/secrets
+*.bak
+*.bak-*
+*.backup
+*.backup-*
+*.before
+*.before-*
+
+# Exclude generated Laravel bootstrap cache
+bootstrap/cache/*.php

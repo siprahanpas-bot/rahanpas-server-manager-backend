@@ -1,0 +1,57 @@
+<?php
+
+namespace App\Models;
+
+use Database\Factories\UserFactory;
+use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Attributes\Hidden;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Laravel\Sanctum\HasApiTokens;
+use Illuminate\Notifications\Notifiable;
+
+#[Fillable(['name', 'email', 'phone', 'password', 'account_status'])]
+#[Hidden(['password', 'remember_token'])]
+class User extends Authenticatable
+{
+    /** @use HasFactory<UserFactory> */
+    use HasApiTokens, HasFactory, Notifiable;
+
+    protected function casts(): array
+    {
+        return [
+            'email_verified_at' => 'datetime',
+            'password' => 'hashed',
+        ];
+    }
+
+    public function managedServers(): HasMany
+    {
+        return $this->hasMany(ManagedServer::class);
+    }
+
+    public function groups(): BelongsToMany
+    {
+        return $this->belongsToMany(Group::class);
+    }
+
+    public function hasPermission(string $permission): bool
+    {
+        // Akun lama yang belum dimasukkan ke group tetap berfungsi.
+        if ($this->groups()->get()->isEmpty()) {
+            return true;
+        }
+
+        return $this->groups()
+            ->whereHas('roles', function ($query) use ($permission) {
+                $query->where('slug', 'super-administrator')
+                    ->orWhereHas('permissions', function ($permissionQuery) use ($permission) {
+                        $permissionQuery->where('slug', $permission);
+                    });
+            })
+            ->get()
+            ->isNotEmpty();
+    }
+}

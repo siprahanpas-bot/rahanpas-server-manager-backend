@@ -1,0 +1,7 @@
+{
+  "name": "rahanpas-rdp-ws",
+  "private": true,
+  "dependencies": {
+    "guacamole-lite": "^1.0.2"
+  }
+}

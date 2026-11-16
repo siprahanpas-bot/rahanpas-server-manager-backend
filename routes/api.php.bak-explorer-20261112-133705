@@ -1,0 +1,37 @@
+<?php
+
+use App\Http\Controllers\Api\AuthController;
+use App\Http\Controllers\Api\ServerController;
+use App\Http\Controllers\Api\MonitoringController;
+use App\Http\Controllers\Api\RemoteFileManagerController;
+use Illuminate\Support\Facades\Route;
+
+Route::post('/login', [AuthController::class, 'login'])
+    ->middleware('throttle:5,1');
+
+Route::middleware('auth:sanctum')->group(function () {
+    Route::post('/logout', [AuthController::class, 'logout']);
+    Route::get('/me', [AuthController::class, 'me']);
+
+    Route::get('/servers', [ServerController::class, 'index']);
+    Route::post('/servers', [ServerController::class, 'store']);
+    Route::get('/servers/{id}', [ServerController::class, 'show']);
+    Route::get('/servers/{id}/monitoring', [MonitoringController::class, 'show'])->middleware('throttle:30,1');
+    Route::get('/servers/{id}/monitoring/history', [MonitoringController::class, 'history'])->middleware('throttle:60,1');
+    Route::get('/servers/{id}/files', [RemoteFileManagerController::class, 'files'])
+        ->middleware('throttle:30,1');
+    Route::get('/servers/{id}/storage-devices', [RemoteFileManagerController::class, 'storageDevices'])
+        ->middleware('throttle:12,1');
+    Route::post('/servers/{id}/storage-devices/inspect-format', [RemoteFileManagerController::class, 'inspectStorageDeviceFormat'])
+        ->middleware('throttle:6,1');
+    Route::post('/servers/{id}/storage-devices/format', [RemoteFileManagerController::class, 'formatStorageDevice'])
+        ->middleware('throttle:2,1');
+    Route::post('/servers/{id}/files/upload', [RemoteFileManagerController::class, 'upload'])
+        ->middleware('throttle:10,1');
+    Route::get('/servers/{id}/files/download', [RemoteFileManagerController::class, 'download'])
+        ->middleware('throttle:20,1');
+    Route::put('/servers/{id}', [ServerController::class, 'update']);
+    Route::post('/servers/{id}/discover-host-key', [ServerController::class, 'discoverHostKey']);
+    Route::post('/servers/{id}/test-connection', [ServerController::class, 'testConnection']);
+    Route::delete('/servers/{id}', [ServerController::class, 'destroy']);
+});

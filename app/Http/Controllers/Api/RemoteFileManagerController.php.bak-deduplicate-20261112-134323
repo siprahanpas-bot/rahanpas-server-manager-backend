@@ -1,0 +1,548 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Services\RemoteFileManagerService;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
+use Throwable;
+
+class RemoteFileManagerController extends Controller
+{
+    public function files(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['nullable', 'string', 'max:4096'],
+        ]);
+
+        $server = $request->user()
+            ->managedServers()
+            ->findOrFail($id);
+
+        try {
+            $result = $fileManager->listDirectory(
+                $server,
+                $data['path'] ?? null
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function createDirectory(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+            'name' => ['required', 'string', 'max:255'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->createDirectory(
+                $server,
+                $data['path'],
+                $data['name']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Folder berhasil dibuat.',
+                'data' => $result,
+            ], 201);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function renameEntry(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+            'name' => ['required', 'string', 'max:255'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->renameEntry(
+                $server,
+                $data['path'],
+                $data['name']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Nama item berhasil diubah.',
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function deleteEntry(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->deleteEntry(
+                $server,
+                $data['path']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Item berhasil dihapus.',
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function createDirectory(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+            'name' => ['required', 'string', 'max:255'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->createDirectory(
+                $server,
+                $data['path'],
+                $data['name']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Folder berhasil dibuat.',
+                'data' => $result,
+            ], 201);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function renameEntry(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+            'name' => ['required', 'string', 'max:255'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->renameEntry(
+                $server,
+                $data['path'],
+                $data['name']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Nama item berhasil diubah.',
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function deleteEntry(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->deleteEntry(
+                $server,
+                $data['path']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Item berhasil dihapus.',
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function createDirectory(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+            'name' => ['required', 'string', 'max:255'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->createDirectory(
+                $server,
+                $data['path'],
+                $data['name']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Folder berhasil dibuat.',
+                'data' => $result,
+            ], 201);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function renameEntry(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+            'name' => ['required', 'string', 'max:255'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->renameEntry(
+                $server,
+                $data['path'],
+                $data['name']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Nama item berhasil diubah.',
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function deleteEntry(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+        ]);
+
+        $server = $request->user()->managedServers()->findOrFail($id);
+
+        try {
+            $result = $fileManager->deleteEntry(
+                $server,
+                $data['path']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'Item berhasil dihapus.',
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function upload(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ) {
+        $data = $request->validate([
+            'file' => ['required', 'file', 'max:102400'],
+            'path' => ['nullable', 'string', 'max:4096'],
+        ]);
+
+        $server = $request->user()
+            ->managedServers()
+            ->findOrFail($id);
+
+        try {
+            $file = $data['file'];
+
+            $result = $fileManager->uploadFile(
+                $server,
+                $file->getRealPath(),
+                $file->getClientOriginalName(),
+                $data['path'] ?? null
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'message' => 'File berhasil diunggah.',
+                'data' => $result,
+            ], 201);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function download(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ) {
+        $data = $request->validate([
+            'path' => ['required', 'string', 'max:4096'],
+        ]);
+
+        $server = $request->user()
+            ->managedServers()
+            ->findOrFail($id);
+
+        $download = null;
+
+        try {
+            $download = $fileManager->prepareDownload(
+                $server,
+                $data['path']
+            );
+
+            $localPath = $download['local_path'];
+
+            // Hilangkan karakter kontrol agar nama file aman untuk header HTTP.
+            $filename = preg_replace(
+                '/[\\x00-\\x1F\\x7F]/',
+                '_',
+                $download['filename']
+            );
+
+            if (!is_string($filename) || $filename === '') {
+                $filename = 'download';
+            }
+
+            return response()->streamDownload(
+                function () use ($localPath) {
+                    $stream = null;
+
+                    try {
+                        $stream = @fopen($localPath, 'rb');
+
+                        if ($stream === false) {
+                            throw new \RuntimeException(
+                                'Gagal membuka temporary file download.'
+                            );
+                        }
+
+                        fpassthru($stream);
+                    } finally {
+                        if (is_resource($stream)) {
+                            fclose($stream);
+                        }
+
+                        @unlink($localPath);
+                    }
+                },
+                $filename,
+                [
+                    'Content-Type' => 'application/octet-stream',
+                    'Content-Length' => (string) $download['size'],
+                    'X-Content-Type-Options' => 'nosniff',
+                ]
+            );
+        } catch (Throwable $exception) {
+            if (
+                is_array($download) &&
+                isset($download['local_path']) &&
+                is_file($download['local_path'])
+            ) {
+                @unlink($download['local_path']);
+            }
+
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function inspectStorageDeviceFormat(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'device_path' => [
+                'required',
+                'string',
+                'max:255',
+                'regex:/^\\/dev\\/[A-Za-z0-9._-]+$/',
+            ],
+        ]);
+
+        $server = $request->user()
+            ->managedServers()
+            ->findOrFail($id);
+
+        try {
+            $result = $fileManager->inspectStorageDeviceFormat(
+                $server,
+                $data['device_path']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function formatStorageDevice(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $data = $request->validate([
+            'device_path' => [
+                'required',
+                'string',
+                'max:255',
+                'regex:/^\\/dev\\/[A-Za-z0-9._-]+$/',
+            ],
+            'fingerprint' => [
+                'required',
+                'string',
+                'regex:/^[a-f0-9]{64}$/',
+            ],
+            'filesystem' => [
+                'required',
+                'string',
+                'in:ext4,xfs,btrfs',
+            ],
+            'label' => [
+                'nullable',
+                'string',
+                'max:12',
+                'regex:/^[A-Za-z0-9._-]*$/',
+            ],
+            'confirmation' => [
+                'required',
+                'string',
+                'max:255',
+                'same:device_path',
+            ],
+        ]);
+
+        $server = $request->user()
+            ->managedServers()
+            ->findOrFail($id);
+
+        try {
+            $result = $fileManager->formatStorageDevice(
+                $server,
+                $data['device_path'],
+                $data['fingerprint'],
+                $data['filesystem'],
+                $data['label'] ?? '',
+                $data['confirmation']
+            );
+
+            return response()->json([
+                'server_id' => $server->id,
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+
+    public function storageDevices(
+        Request $request,
+        int $id,
+        RemoteFileManagerService $fileManager
+    ): JsonResponse {
+        $server = $request->user()
+            ->managedServers()
+            ->findOrFail($id);
+
+        try {
+            $result = $fileManager->getStorageDevices($server);
+
+            return response()->json([
+                'server_id' => $server->id,
+                'data' => $result,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'message' => $exception->getMessage(),
+            ], 502);
+        }
+    }
+}

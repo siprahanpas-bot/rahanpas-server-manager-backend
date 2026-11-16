@@ -1,0 +1,14 @@
+/node_modules
+/public/hot
+/public/storage
+/storage/*.key
+/vendor
+.env
+.env.*
+!.env.example
+.DS_Store
+auth.json
+*.bak*
+*.backup*
+*.before-*
+database/*.sqlite

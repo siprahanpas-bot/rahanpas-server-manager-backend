@@ -1,0 +1,73 @@
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    image: ${BACKEND_NGINX_IMAGE:-rahanpas-backend-nginx:latest}
+    container_name: ${BACKEND_CONTAINER_NAME:-rahanpas-backend-nginx}
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8080}:80"
+    volumes:
+      - backend-storage:/var/www/html/storage:ro
+    depends_on:
+      - php-fpm
+    networks:
+      - rahanpas_net
+
+  php-fpm:
+    build:
+      context: .
+      dockerfile: deploy/php-fpm/Dockerfile
+    image: ${BACKEND_FPM_IMAGE:-rahanpas-backend-php-fpm:latest}
+    container_name: ${BACKEND_FPM_CONTAINER:-rahanpas-backend-php-fpm}
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - backend-storage:/var/www/html/storage
+    networks:
+      rahanpas_net:
+        aliases:
+          - backend-php-fpm
+
+  php-cli:
+    build:
+      context: .
+      dockerfile: deploy/php-cli/Dockerfile
+    image: ${BACKEND_CLI_IMAGE:-rahanpas-backend-php-cli:latest}
+    profiles:
+      - tools
+    env_file:
+      - .env
+    volumes:
+      - backend-storage:/var/www/html/storage
+    networks:
+      - rahanpas_net
+
+  rdp-ws:
+    build:
+      context: .
+      dockerfile: deploy/rdp-ws/Dockerfile
+    image: ${RDP_BRIDGE_IMAGE:-rahanpas-rdp-ws:latest}
+    container_name: ${RDP_CONTAINER_NAME:-rahanpas-rdp-ws}
+    restart: unless-stopped
+    ports:
+      - "${RDP_BRIDGE_PUBLIC_PORT:-13002}:${RDP_BRIDGE_PORT:-8080}"
+    environment:
+      NODE_ENV: production
+      RDP_BRIDGE_SECRET: ${RDP_BRIDGE_SECRET:?RDP_BRIDGE_SECRET wajib diisi}
+      RDP_BRIDGE_PORT: ${RDP_BRIDGE_PORT:-8080}
+      GUACD_HOST: ${GUACD_HOST:-rahanpas-guacd}
+      GUACD_PORT: ${GUACD_PORT:-4822}
+    networks:
+      - rahanpas_net
+
+networks:
+  rahanpas_net:
+    name: ${DOCKER_NETWORK:-baota_net}
+    external: true
+
+volumes:
+  backend-storage:
+    name: ${BACKEND_STORAGE_VOLUME:-rahanpas-backend-storage}

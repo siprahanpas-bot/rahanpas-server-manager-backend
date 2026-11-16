@@ -1,0 +1,127 @@
+<?php
+
+namespace App\Console\Commands;
+
+use App\Models\ManagedServer;
+use App\Services\SshConnectionService;
+use App\Services\WinRmConnectionService;
+use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
+use RuntimeException;
+use Throwable;
+
+class CollectServerMonitoring extends Command
+{
+    protected $signature = 'monitoring:collect {--server= : Hanya monitor server berdasarkan ID}';
+
+    protected $description = 'Mengumpulkan dan menyimpan metrik monitoring server Linux (SSH) dan Windows (WinRM)';
+
+    public function handle(SshConnectionService $ssh, WinRmConnectionService $winrm): int
+    {
+        $serverId = $this->option('server');
+
+        $servers = ManagedServer::query()
+            ->where(function ($query) {
+                $query->where(fn ($q) => $q->where('os_type', 'linux')->where('connection_protocol', 'ssh'))
+                    ->orWhere(fn ($q) => $q->where('os_type', 'windows')->where('connection_protocol', 'winrm'));
+            })
+            ->when($serverId, fn ($query) => $query->whereKey($serverId))
+            ->orderBy('id')
+            ->get();
+
+        if ($servers->isEmpty()) {
+            $this->warn('Tidak ada server Linux SSH atau Windows WinRM yang memenuhi kriteria.');
+            return self::SUCCESS;
+        }
+
+        $success = 0;
+        $failed = 0;
+
+        foreach ($servers as $server) {
+            $this->line("Memproses server #{$server->id} ({$server->name})...");
+
+            try {
+                $metrics = match ([$server->os_type, $server->connection_protocol]) {
+                    ['linux', 'ssh'] => $ssh->collectMetrics($server),
+                    ['windows', 'winrm'] => $winrm->collectMetrics($server),
+                    default => throw new RuntimeException('Kombinasi OS dan protokol belum didukung.'),
+                };
+
+                $collectedAt = Carbon::parse($metrics['collected_at']);
+
+                $server->forceFill([
+                    'status' => 'online',
+                    'last_checked_at' => now(),
+                    'last_error' => null,
+                ])->save();
+
+                $server->metricHistories()->create([
+                    'hostname' => $metrics['hostname'],
+                    'os_name' => $metrics['os_name'],
+                    'kernel' => $metrics['kernel'],
+                    'uptime_seconds' => $metrics['uptime_seconds'],
+
+                    'cpu_usage_percent' => $metrics['cpu']['usage_percent'],
+
+                    'memory_usage_percent' => $metrics['memory']['usage_percent'],
+                    'memory_used_mb' => $metrics['memory']['used_mb'],
+                    'memory_total_mb' => $metrics['memory']['total_mb'],
+
+                    'swap_usage_percent' => $metrics['swap']['usage_percent'],
+                    'swap_used_mb' => $metrics['swap']['used_mb'],
+                    'swap_total_mb' => $metrics['swap']['total_mb'],
+
+                    'disk_usage_percent' => $metrics['disk']['usage_percent'],
+                    'disk_used_gb' => $metrics['disk']['used_gb'],
+                    'disk_total_gb' => $metrics['disk']['total_gb'],
+
+                    'network_rx_bytes' => $metrics['network']['rx_bytes'],
+                    'network_tx_bytes' => $metrics['network']['tx_bytes'],
+
+                    'load_average' => $metrics['load_average'],
+                    'collected_at' => $collectedAt,
+                ]);
+
+                $historyMessage = 'snapshot tersimpan';
+
+                $success++;
+
+                $this->info(
+                    "ONLINE | CPU {$metrics['cpu']['usage_percent']}% | " .
+                    "RAM {$metrics['memory']['usage_percent']}% | " .
+                    "Disk {$metrics['disk']['usage_percent']}% | {$historyMessage}"
+                );
+            } catch (Throwable $exception) {
+                $message = $exception->getMessage();
+
+                try {
+                    $server->forceFill([
+                        'status' => 'error',
+                        'last_checked_at' => now(),
+                        'last_error' => mb_substr($message, 0, 65000),
+                    ])->save();
+                } catch (Throwable $statusException) {
+                    Log::error('Gagal memperbarui status monitoring server.', [
+                        'managed_server_id' => $server->id,
+                        'error' => $statusException->getMessage(),
+                    ]);
+                }
+
+                Log::warning('Background server monitoring gagal.', [
+                    'managed_server_id' => $server->id,
+                    'error' => $message,
+                ]);
+
+                $failed++;
+
+                $this->error("ERROR | Server #{$server->id}: {$message}");
+            }
+        }
+
+        $this->newLine();
+        $this->info("Selesai. Berhasil: {$success} | Gagal: {$failed}");
+
+        return $failed > 0 ? self::FAILURE : self::SUCCESS;
+    }
+}
