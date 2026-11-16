@@ -55,11 +55,11 @@ services:
     ports:
       - "${RDP_BRIDGE_PUBLIC_PORT:-13002}:${RDP_BRIDGE_PORT:-8080}"
     environment:
-      NODE_ENV: production
-      RDP_BRIDGE_SECRET: ${RDP_BRIDGE_SECRET:?RDP_BRIDGE_SECRET wajib diisi}
-      RDP_BRIDGE_PORT: ${RDP_BRIDGE_PORT:-8080}
-      GUACD_HOST: ${GUACD_HOST:-rahanpas-guacd}
-      GUACD_PORT: ${GUACD_PORT:-4822}
+      - NODE_ENV=production
+      - RDP_BRIDGE_SECRET=${RDP_BRIDGE_SECRET}
+      - RDP_BRIDGE_PORT=${RDP_BRIDGE_PORT:-8080}
+      - GUACD_HOST=${GUACD_HOST:-rahanpas-guacd}
+      - GUACD_PORT=${GUACD_PORT:-4822}
     networks:
       - rahanpas_net
 
