@@ -48,7 +48,8 @@ class CollectServerMonitoring extends Command
                     default => throw new RuntimeException('Kombinasi OS dan protokol belum didukung.'),
                 };
 
-                $collectedAt = Carbon::parse($metrics['collected_at']);
+                $collectedAt = Carbon::parse($metrics['collected_at'])
+                    ->setTimezone(config('app.timezone'));
 
                 $server->forceFill([
                     'status' => 'online',

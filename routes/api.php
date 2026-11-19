@@ -18,6 +18,8 @@ Route::post('/register/resend-verification', [AuthController::class, 'resendVeri
 Route::post('/register/verify-email', [AuthController::class, 'verifyEmail'])->middleware('throttle:10,1');
 Route::post('/register/set-password', [AuthController::class, 'setPassword'])->middleware('throttle:10,1');
 Route::post('/login', [AuthController::class, 'login'])->middleware('throttle:10,1');
+Route::post('/forgot-password', [AuthController::class, 'forgotPassword'])->middleware('throttle:5,1');
+Route::post('/reset-password', [AuthController::class, 'resetPassword'])->middleware('throttle:10,1');
 Route::get('/auth/google/config', [AuthController::class, 'googleConfig']);
 Route::post('/auth/google/exchange', [AuthController::class, 'googleExchange'])->middleware('throttle:10,1');
 

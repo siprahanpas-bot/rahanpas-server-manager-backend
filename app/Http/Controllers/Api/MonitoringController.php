@@ -3,89 +3,65 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Services\SshConnectionService;
-use App\Services\WinRmConnectionService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Log;
-use RuntimeException;
-use Throwable;
 
 class MonitoringController extends Controller
 {
-    public function show(
-        Request $request,
-        int $id,
-        SshConnectionService $ssh,
-        WinRmConnectionService $winrm
-    ): JsonResponse {
+    public function show(Request $request, int $id): JsonResponse
+    {
         $server = $request->user()
             ->managedServers()
+            ->with('latestMetric')
             ->findOrFail($id);
 
-        try {
-            $metrics = match ([$server->os_type, $server->connection_protocol]) {
-                ['linux', 'ssh'] => $ssh->collectMetrics($server),
-                ['windows', 'winrm'] => $winrm->collectMetrics($server),
-                default => throw new RuntimeException('Kombinasi OS dan protokol belum didukung untuk monitoring.'),
-            };
+        $snapshot = $server->latestMetric;
 
-            $server->forceFill([
-                'status' => 'online',
-                'last_checked_at' => now(),
-                'last_error' => null,
-            ])->save();
+        $metrics = null;
 
-            $latestSnapshot = $server->metricHistories()->latest('collected_at')->first();
-            if (!$latestSnapshot || $latestSnapshot->collected_at->lt(now()->subSeconds(60))) {
-                $server->metricHistories()->create([
-                    'hostname' => $metrics['hostname'],
-                    'os_name' => $metrics['os_name'],
-                    'kernel' => $metrics['kernel'],
-                    'uptime_seconds' => $metrics['uptime_seconds'],
-                    'cpu_usage_percent' => $metrics['cpu']['usage_percent'],
-                    'memory_usage_percent' => $metrics['memory']['usage_percent'],
-                    'memory_used_mb' => $metrics['memory']['used_mb'],
-                    'memory_total_mb' => $metrics['memory']['total_mb'],
-                    'swap_usage_percent' => $metrics['swap']['usage_percent'],
-                    'swap_used_mb' => $metrics['swap']['used_mb'],
-                    'swap_total_mb' => $metrics['swap']['total_mb'],
-                    'disk_usage_percent' => $metrics['disk']['usage_percent'],
-                    'disk_used_gb' => $metrics['disk']['used_gb'],
-                    'disk_total_gb' => $metrics['disk']['total_gb'],
-                    'network_rx_bytes' => $metrics['network']['rx_bytes'],
-                    'network_tx_bytes' => $metrics['network']['tx_bytes'],
-                    'load_average' => $metrics['load_average'],
-                    'collected_at' => now(),
-                ]);
-            }
-        } catch (Throwable $exception) {
-            $message = $exception instanceof RuntimeException
-                ? $exception->getMessage()
-                : 'Terjadi kesalahan saat mengambil data monitoring.';
-
-            $server->forceFill([
-                'status' => 'error',
-                'last_checked_at' => now(),
-                'last_error' => $message,
-            ])->save();
-
-            return response()->json([
-                'message' => $message,
-                'server_status' => [
-                    'id' => $server->id,
-                    'status' => 'error',
+        if ($snapshot) {
+            $metrics = [
+                'hostname' => $snapshot->hostname,
+                'os_name' => $snapshot->os_name,
+                'kernel' => $snapshot->kernel,
+                'uptime_seconds' => $snapshot->uptime_seconds,
+                'cpu' => [
+                    'usage_percent' => $snapshot->cpu_usage_percent,
                 ],
-            ], 502);
+                'memory' => [
+                    'usage_percent' => $snapshot->memory_usage_percent,
+                    'used_mb' => $snapshot->memory_used_mb,
+                    'total_mb' => $snapshot->memory_total_mb,
+                ],
+                'swap' => [
+                    'usage_percent' => $snapshot->swap_usage_percent,
+                    'used_mb' => $snapshot->swap_used_mb,
+                    'total_mb' => $snapshot->swap_total_mb,
+                ],
+                'disk' => [
+                    'usage_percent' => $snapshot->disk_usage_percent,
+                    'used_gb' => $snapshot->disk_used_gb,
+                    'total_gb' => $snapshot->disk_total_gb,
+                ],
+                'network' => [
+                    'rx_bytes' => $snapshot->network_rx_bytes,
+                    'tx_bytes' => $snapshot->network_tx_bytes,
+                ],
+                'load_average' => $snapshot->load_average ?? [],
+                'collected_at' => $snapshot->collected_at,
+            ];
         }
 
         return response()->json([
-            'message' => 'Monitoring berhasil.',
+            'message' => $snapshot
+                ? 'Snapshot monitoring berhasil diambil.'
+                : 'Belum tersedia snapshot monitoring untuk server ini.',
             'metrics' => $metrics,
             'server_status' => [
                 'id' => $server->id,
-                'status' => 'online',
-                'last_checked_at' => $server->fresh()->last_checked_at,
+                'status' => $server->status,
+                'last_checked_at' => $server->last_checked_at,
+                'last_error' => $server->last_error,
             ],
         ]);
     }
@@ -192,6 +168,8 @@ class MonitoringController extends Controller
                     'height' => $height,
                     'dpi' => 96,
                     'disable-glyph-caching' => true,
+                    'disable-copy' => false,
+                    'disable-paste' => false,
                 ],
             ],
         ];

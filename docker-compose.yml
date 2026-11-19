@@ -25,7 +25,10 @@ services:
     env_file:
       - .env
     volumes:
+      - ./.env:/var/www/html/.env
       - backend-storage:/var/www/html/storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       rahanpas_net:
         aliases:
@@ -41,7 +44,30 @@ services:
     env_file:
       - .env
     volumes:
+      - ./.env:/var/www/html/.env
       - backend-storage:/var/www/html/storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - rahanpas_net
+
+  scheduler:
+    image: ${BACKEND_CLI_IMAGE:-rahanpas-backend-php-cli:latest}
+    container_name: rahanpas-backend-scheduler
+    restart: unless-stopped
+    user: "www-data"
+    command: ["php", "artisan", "schedule:work", "--verbose"]
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/var/www/html/.env:ro
+      - ./config/app.php:/var/www/html/config/app.php:ro
+      - ./routes/console.php:/var/www/html/routes/console.php:ro
+      - backend-storage:/var/www/html/storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - php-fpm
     networks:
       - rahanpas_net
 

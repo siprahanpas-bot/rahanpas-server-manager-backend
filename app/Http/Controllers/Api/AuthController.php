@@ -55,7 +55,7 @@ class AuthController extends Controller
             'updated_at' => now(),
         ]);
 
-        $url = rtrim(config('app.url'), '/') . '/verify-email?email=' .
+        $url = rtrim((string) config('app.frontend_url', config('app.url')), '/') . '/verify-email?email=' .
             urlencode($user->email) . '&token=' . urlencode($token);
 
         Mail::raw(
@@ -105,7 +105,7 @@ class AuthController extends Controller
             'updated_at' => now(),
         ]);
 
-        $url = rtrim(config('app.url'), '/') . '/verify-email?email=' .
+        $url = rtrim((string) config('app.frontend_url', config('app.url')), '/') . '/verify-email?email=' .
             urlencode($user->email) . '&token=' . urlencode($token);
 
         try {
@@ -262,6 +262,125 @@ class AuthController extends Controller
         ]);
     }
 
+
+public function forgotPassword(Request $request): JsonResponse
+{
+    $validated = $request->validate([
+        'email' => ['required', 'email', 'max:255'],
+    ]);
+
+    $email = Str::lower($validated['email']);
+    $user = User::where('email', $email)->first();
+
+    $genericMessage = 'Jika email terdaftar dan aktif, tautan reset password telah dikirim.';
+
+    if (!$user) {
+        return response()->json(['message' => $genericMessage]);
+    }
+
+    $token = Str::random(64);
+    $tokenHash = hash('sha256', $token);
+    $now = now();
+
+    DB::table('account_activation_tokens')->insert([
+        'user_id' => $user->id,
+        'purpose' => 'password_reset',
+        'token_hash' => $tokenHash,
+        'expires_at' => $now->copy()->addHours(2),
+        'created_at' => $now,
+        'updated_at' => $now,
+    ]);
+
+    $url = rtrim((string) config('app.frontend_url', config('app.url')), '/')
+        . '/reset-password?email=' . urlencode($user->email)
+        . '&token=' . urlencode($token);
+
+    try {
+        Mail::raw(
+            "Halo {$user->name},\n\nKami menerima permintaan untuk mengatur ulang password akun Anda.\nKlik tautan berikut untuk membuat password baru:\n\n{$url}\n\nTautan berlaku selama 2 jam. Jika Anda tidak meminta reset password, abaikan email ini.\n\nRAHANPAS SERVER MANAGER",
+            function ($message) use ($user) {
+                $message->to($user->email)
+                    ->subject('Reset Password - RAHANPAS SERVER MANAGER');
+            }
+        );
+    } catch (\Throwable $exception) {
+        DB::table('account_activation_tokens')
+            ->where('token_hash', $tokenHash)
+            ->delete();
+
+        report($exception);
+
+        return response()->json([
+            'message' => 'Email reset password belum berhasil dikirim. Silakan coba kembali nanti.',
+        ], 503);
+    }
+
+    DB::table('account_activation_tokens')
+        ->where('user_id', $user->id)
+        ->where('purpose', 'password_reset')
+        ->whereNull('used_at')
+        ->where('token_hash', '!=' , $tokenHash)
+        ->update([
+            'used_at' => $now,
+            'updated_at' => $now,
+        ]);
+
+    return response()->json(['message' => $genericMessage]);
+}
+
+public function resetPassword(Request $request): JsonResponse
+{
+    $validated = $request->validate([
+        'email' => ['required', 'email'],
+        'token' => ['required', 'string'],
+        'password' => ['required', 'string', 'min:12', 'confirmed'],
+    ]);
+
+    $user = User::where('email', Str::lower($validated['email']))->first();
+
+    if (!$user) {
+        return response()->json(['message' => 'Tautan reset password tidak valid atau sudah kedaluwarsa.'], 422);
+    }
+
+    $reset = DB::transaction(function () use ($user, $validated) {
+        $now = now();
+        $activation = DB::table('account_activation_tokens')
+            ->where('user_id', $user->id)
+            ->where('purpose', 'password_reset')
+            ->where('token_hash', hash('sha256', $validated['token']))
+            ->whereNull('used_at')
+            ->where('expires_at', '>', $now)
+            ->lockForUpdate()
+            ->first();
+
+        if (!$activation) {
+            return false;
+        }
+
+        DB::table('account_activation_tokens')
+            ->where('id', $activation->id)
+            ->update(['used_at' => $now, 'updated_at' => $now]);
+
+        $user->password = $validated['password'];
+        $user->save();
+
+        DB::table('account_activation_tokens')
+            ->where('user_id', $user->id)
+            ->where('purpose', 'password_reset')
+            ->whereNull('used_at')
+            ->update(['used_at' => $now, 'updated_at' => $now]);
+
+        return true;
+    });
+
+    if (!$reset) {
+        return response()->json(['message' => 'Token reset password tidak valid atau sudah kedaluwarsa.'], 422);
+    }
+
+    return response()->json([
+        'message' => 'Password berhasil diperbarui. Silakan login dengan password baru Anda.',
+    ]);
+}
     public function login(Request $request): JsonResponse
     {
         $validated = $request->validate([

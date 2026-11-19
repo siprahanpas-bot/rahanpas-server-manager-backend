@@ -8,8 +8,8 @@ Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
-// Background monitoring khusus server produksi yang sudah diverifikasi.
-Schedule::command('monitoring:collect --server=6')
+// Background monitoring otomatis untuk seluruh server Linux SSH dan Windows WinRM.
+Schedule::command('monitoring:collect')
     ->everyMinute()
     ->withoutOverlapping(2)
     ->appendOutputTo(storage_path('logs/monitoring-scheduler.log'));

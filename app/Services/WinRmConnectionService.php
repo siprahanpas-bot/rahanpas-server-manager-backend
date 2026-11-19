@@ -38,6 +38,63 @@ class WinRmConnectionService
         }
     }
 
+    /**
+     * Menjalankan skrip PowerShell melalui stdin agar tidak terkena
+     * batas panjang command line Windows pada -EncodedCommand.
+     *
+     * Skrip monitoring saat ini menggunakan karakter ASCII.
+     */
+    public function executePowerShellViaStdin(ManagedServer $server, string $psScript, int $timeoutSeconds = 120): string
+    {
+        if ($server->auth_method !== 'password' || !$server->password) {
+            throw new RuntimeException('Koneksi WinRM saat ini membutuhkan autentikasi password.');
+        }
+
+        $scheme = (int) $server->port === 5986 ? 'https' : 'http';
+        $port = $server->port ?: 5985;
+        $endpoint = "{$scheme}://{$server->ip_address}:{$port}/wsman";
+
+        $shellId = null;
+
+        try {
+            $shellId = $this->openShell($endpoint, $server, $timeoutSeconds);
+            $commandId = $this->runCommandViaStdin(
+                $endpoint,
+                $server,
+                $shellId,
+                $timeoutSeconds
+            );
+
+            // Kirim skrip sebagai UTF-8. Skrip monitoring menggunakan ASCII,
+            // sehingga tidak bergantung pada code page karakter Windows.
+            $this->sendInput(
+                $endpoint,
+                $server,
+                $shellId,
+                $commandId,
+                base64_encode($psScript),
+                true,
+                $timeoutSeconds
+            );
+
+            return $this->receiveOutput(
+                $endpoint,
+                $server,
+                $shellId,
+                $commandId,
+                $timeoutSeconds
+            );
+        } finally {
+            if ($shellId !== null) {
+                try {
+                    $this->closeShell($endpoint, $server, $shellId);
+                } catch (Throwable) {
+                    // Abaikan error saat menutup shell.
+                }
+            }
+        }
+    }
+
     public function executePowerShellWithStdin(ManagedServer $server, string $psScript, string $localFilePath, int $timeoutSeconds = 120): string
     {
         if ($server->auth_method !== 'password' || !$server->password) {
@@ -90,7 +147,11 @@ class WinRmConnectionService
     public function collectMetrics(ManagedServer $server): array
     {
         try {
-            $rawOutput = $this->executePowerShell($server, $this->buildMetricsScript());
+            $rawOutput = $this->executePowerShellViaStdin(
+                $server,
+                $this->buildMetricsScript(),
+                120
+            );
             $data = json_decode(trim($rawOutput), true);
 
             if (!is_array($data) || !isset($data['hostname'])) {
@@ -159,7 +220,7 @@ class WinRmConnectionService
         return <<<'POWERSHELL'
 $ErrorActionPreference = 'SilentlyContinue'
 $os = Get-CimInstance Win32_OperatingSystem
-$uptime = [int]((Get-Date) - $os.LastBootUpTime).TotalSeconds
+$uptime = [int64][math]::Max(0, [math]::Floor(((Get-Date) - $os.LastBootUpTime).TotalSeconds))
 
 $cpu = (Get-Counter '\Processor(_Total)\% Processor Time').CounterSamples[0].CookedValue
 if ($null -eq $cpu) {
@@ -177,11 +238,108 @@ $drive = $env:SystemDrive
 if (-not $drive) { $drive = 'C:' }
 $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$drive'"
 
-$rx = 0
-$tx = 0
-Get-NetAdapterStatistics | ForEach-Object {
-    $rx += [int64]$_.ReceivedBytes
-    $tx += [int64]$_.SentBytes
+$rx = [int64]0
+$tx = [int64]0
+
+try {
+    if (-not ('WinIfHelper' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct MIB_IF_ROW2
+{
+    public ulong InterfaceLuid;
+    public uint InterfaceIndex;
+    public Guid InterfaceGuid;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)]
+    public string Alias;
+
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 257)]
+    public string Description;
+
+    public uint PhysicalAddressLength;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] PhysicalAddress;
+
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+    public byte[] PermanentPhysicalAddress;
+
+    public uint Mtu;
+    public uint Type;
+    public int TunnelType;
+    public int MediaType;
+    public int PhysicalMediumType;
+    public int AccessType;
+    public int DirectionType;
+    public byte InterfaceAndOperStatusFlags;
+    public int OperStatus;
+    public int AdminStatus;
+    public int MediaConnectState;
+    public Guid NetworkGuid;
+    public int ConnectionType;
+    public ulong TransmitLinkSpeed;
+    public ulong ReceiveLinkSpeed;
+    public ulong InOctets;
+    public ulong InUcastPkts;
+    public ulong InNUcastPkts;
+    public ulong InDiscards;
+    public ulong InErrors;
+    public ulong InUnknownProtos;
+    public ulong InUcastOctets;
+    public ulong InMulticastOctets;
+    public ulong InBroadcastOctets;
+    public ulong OutOctets;
+    public ulong OutUcastPkts;
+    public ulong OutNUcastPkts;
+    public ulong OutDiscards;
+    public ulong OutErrors;
+    public ulong OutUcastOctets;
+    public ulong OutMulticastOctets;
+    public ulong OutBroadcastOctets;
+    public ulong OutQLen;
+}
+
+public static class WinIfHelper
+{
+    [DllImport("iphlpapi.dll", ExactSpelling = true)]
+    public static extern uint GetIfEntry2(ref MIB_IF_ROW2 row);
+}
+'@ -ErrorAction Stop
+    }
+
+    $adapters = @(
+        Get-NetAdapter -ErrorAction Stop |
+        Where-Object { $_.Status -eq 'Up' }
+    )
+
+    foreach ($adapter in $adapters) {
+        try {
+            $row = New-Object MIB_IF_ROW2
+            $row.InterfaceIndex = [uint32]$adapter.ifIndex
+            $row.PhysicalAddress = New-Object byte[] 32
+            $row.PermanentPhysicalAddress = New-Object byte[] 32
+
+            $apiResult = [WinIfHelper]::GetIfEntry2([ref]$row)
+
+            if ($apiResult -eq 0) {
+                $rx += [int64]$row.InUcastOctets
+                $rx += [int64]$row.InMulticastOctets
+                $rx += [int64]$row.InBroadcastOctets
+
+                $tx += [int64]$row.OutUcastOctets
+                $tx += [int64]$row.OutMulticastOctets
+                $tx += [int64]$row.OutBroadcastOctets
+            }
+        } catch {
+            continue
+        }
+    }
+} catch {
+    # Network counters remain zero if the Windows API is unavailable.
 }
 
 $result = [ordered]@{
@@ -278,6 +436,55 @@ XML;
 
         if (empty($nodes)) {
             throw new RuntimeException('Gagal menjalankan perintah di WinRM.');
+        }
+
+        return (string) $nodes[0];
+    }
+
+    /**
+     * Memulai PowerShell dengan membaca perintah dari standard input.
+     */
+    private function runCommandViaStdin(
+        string $endpoint,
+        ManagedServer $server,
+        string $shellId,
+        int $timeout
+    ): string {
+        $uuid = $this->uuid();
+
+        $xml = <<<XML
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+            xmlns:wsman="http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd"
+            xmlns:rsp="http://schemas.microsoft.com/wbem/wsman/1/windows/shell">
+  <s:Header>
+    <wsa:To>{$endpoint}</wsa:To>
+    <wsa:ReplyTo>
+      <wsa:Address s:mustUnderstand="true">http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:Address>
+    </wsa:ReplyTo>
+    <wsman:ResourceURI s:mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd</wsman:ResourceURI>
+    <wsa:Action s:mustUnderstand="true">http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command</wsa:Action>
+    <wsman:MaxEnvelopeSize s:mustUnderstand="true">512000</wsman:MaxEnvelopeSize>
+    <wsa:MessageID>uuid:{$uuid}</wsa:MessageID>
+    <wsman:SelectorSet>
+      <wsman:Selector Name="ShellId">{$shellId}</wsman:Selector>
+    </wsman:SelectorSet>
+    <wsman:OperationTimeout>PT{$timeout}S</wsman:OperationTimeout>
+  </s:Header>
+  <s:Body>
+    <rsp:CommandLine>
+      <rsp:Command>powershell</rsp:Command>
+      <rsp:Arguments>-NoProfile -NonInteractive -Command -</rsp:Arguments>
+    </rsp:CommandLine>
+  </s:Body>
+</s:Envelope>
+XML;
+
+        $response = $this->sendSoap($endpoint, $server, $xml, $timeout);
+        $nodes = $response->xpath('//*[local-name()="CommandId"]');
+
+        if (empty($nodes)) {
+            throw new RuntimeException('Gagal menjalankan PowerShell melalui stdin WinRM.');
         }
 
         return (string) $nodes[0];
