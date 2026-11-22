@@ -461,4 +461,385 @@ SHELL;
         }
     }
 
+
+    /**
+     * Mendeteksi dukungan WireGuard melalui SSH secara read-only.
+     * Tidak mengubah interface maupun konfigurasi remote.
+     */
+    public function detectWireGuardSupport(ManagedServer $server): bool
+    {
+        $ssh = $this->createConnection($server);
+
+        try {
+            $publicHostKey = $ssh->getServerPublicHostKey();
+
+            if ($publicHostKey === false || !is_string($publicHostKey)) {
+                throw new RuntimeException('Host key SSH tidak valid.');
+            }
+
+            $parts = preg_split('/\s+/', trim($publicHostKey), 2);
+
+            if (
+                count($parts) !== 2 ||
+                !preg_match('/^[A-Za-z0-9@._+-]+$/', $parts[0])
+            ) {
+                throw new RuntimeException('Format host key SSH tidak valid.');
+            }
+
+            $rawKey = base64_decode($parts[1], true);
+
+            if ($rawKey === false || $rawKey === '') {
+                throw new RuntimeException('Host key SSH tidak valid.');
+            }
+
+            $fingerprint = 'SHA256:' . rtrim(
+                base64_encode(hash('sha256', $rawKey, true)),
+                '='
+            );
+
+            if ($server->verify_host_key) {
+                if (!$server->host_key_fingerprint) {
+                    throw new RuntimeException(
+                        'Fingerprint host key belum didaftarkan.'
+                    );
+                }
+
+                if (!hash_equals($server->host_key_fingerprint, $fingerprint)) {
+                    throw new RuntimeException(
+                        'Fingerprint host key tidak cocok. Koneksi ditolak.'
+                    );
+                }
+            }
+
+            if ($server->auth_method === 'password') {
+                $authenticated = $ssh->login(
+                    $server->username,
+                    $server->password
+                );
+            } elseif ($server->auth_method === 'private_key') {
+                if (!$server->private_key) {
+                    throw new RuntimeException('Private key belum tersedia.');
+                }
+
+                try {
+                    $key = PublicKeyLoader::load(
+                        $server->private_key,
+                        $server->private_key_passphrase ?: false
+                    );
+                } catch (Throwable) {
+                    throw new RuntimeException(
+                        'Private key tidak valid atau passphrase tidak sesuai.'
+                    );
+                }
+
+                $authenticated = $ssh->login($server->username, $key);
+            } else {
+                throw new RuntimeException(
+                    'Metode autentikasi SSH tidak didukung.'
+                );
+            }
+
+            if (!$authenticated) {
+                throw new RuntimeException('Autentikasi SSH gagal.');
+            }
+
+            $ssh->setTimeout(15);
+
+            $command = <<<'SHELL'
+LC_ALL=C sh -c '
+if ! command -v wg >/dev/null 2>&1; then
+    printf "WG_UNSUPPORTED\n"
+elif ! command -v ip >/dev/null 2>&1; then
+    printf "WG_PROBE_ERROR\n"
+else
+    interfaces="$(ip -o link show type wireguard 2>/dev/null)" || {
+        printf "WG_PROBE_ERROR\n"
+        exit 0
+    }
+
+    if [ -n "$interfaces" ]; then
+        printf "WG_SUPPORTED\n"
+    else
+        printf "WG_UNSUPPORTED\n"
+    fi
+fi
+'
+SHELL;
+
+            $output = $ssh->exec($command);
+
+            if (!is_string($output)) {
+                throw new RuntimeException(
+                    'Gagal menjalankan deteksi WireGuard melalui SSH.'
+                );
+            }
+
+            $result = trim($output);
+
+            if ($result === 'WG_SUPPORTED') {
+                return true;
+            }
+
+            if ($result === 'WG_UNSUPPORTED') {
+                return false;
+            }
+
+            throw new RuntimeException(
+                'Hasil pemeriksaan dukungan WireGuard tidak valid.'
+            );
+        } catch (RuntimeException $exception) {
+            throw $exception;
+        } catch (Throwable) {
+            throw new RuntimeException(
+                'Terjadi kesalahan saat mendeteksi WireGuard melalui SSH.'
+            );
+        } finally {
+            $ssh->disconnect();
+        }
+    }
+
+    /**
+     * Menjalankan operasi WireGuard yang telah di-whitelist.
+     * Tidak menyediakan eksekusi shell generik.
+     */
+    public function executeWireGuardOperation(
+        ManagedServer $server,
+        string $operation,
+        array $parameters = []
+    ): array {
+        if (!in_array($operation, ['status', 'peers', 'create', 'get-config'], true)) {
+            throw new RuntimeException('Operasi WireGuard tidak diizinkan.');
+        }
+
+        if (in_array($operation, ['create', 'get-config'], true)) {
+            $name = $parameters['name'] ?? null;
+
+            if (
+                array_keys($parameters) !== ['name'] ||
+                !is_string($name) ||
+                !preg_match('/\\A[A-Za-z0-9_-]{1,32}\\z/', $name)
+            ) {
+                throw new RuntimeException('Nama peer WireGuard tidak valid.');
+            }
+        } elseif ($parameters !== []) {
+            throw new RuntimeException(
+                'Parameter operasi WireGuard tidak diizinkan.'
+            );
+        }
+
+        $ssh = $this->createConnection($server);
+
+        try {
+            // Verifikasi host key sebelum autentikasi.
+            $publicHostKey = $ssh->getServerPublicHostKey();
+
+            if ($publicHostKey === false || !is_string($publicHostKey)) {
+                throw new RuntimeException('Host key SSH tidak valid.');
+            }
+
+            $parts = preg_split('/\s+/', trim($publicHostKey), 2);
+
+            if (
+                count($parts) !== 2 ||
+                !preg_match('/^[A-Za-z0-9@._+-]+$/', $parts[0])
+            ) {
+                throw new RuntimeException('Format host key SSH tidak valid.');
+            }
+
+            $rawKey = base64_decode($parts[1], true);
+
+            if ($rawKey === false || $rawKey === '') {
+                throw new RuntimeException('Host key SSH tidak valid.');
+            }
+
+            $fingerprint = 'SHA256:' . rtrim(
+                base64_encode(hash('sha256', $rawKey, true)),
+                '='
+            );
+
+            // Fail closed apabila verifikasi host key diaktifkan.
+            if ($server->verify_host_key) {
+                if (!$server->host_key_fingerprint) {
+                    throw new RuntimeException(
+                        'Fingerprint host key belum didaftarkan.'
+                    );
+                }
+
+                if (!hash_equals(
+                    $server->host_key_fingerprint,
+                    $fingerprint
+                )) {
+                    throw new RuntimeException(
+                        'Fingerprint host key tidak cocok. Koneksi ditolak.'
+                    );
+                }
+            }
+
+            // Autentikasi setelah verifikasi identitas host.
+            if ($server->auth_method === 'password') {
+                $authenticated = $ssh->login(
+                    $server->username,
+                    $server->password
+                );
+            } elseif ($server->auth_method === 'private_key') {
+                if (!$server->private_key) {
+                    throw new RuntimeException('Private key belum tersedia.');
+                }
+
+                try {
+                    $key = PublicKeyLoader::load(
+                        $server->private_key,
+                        $server->private_key_passphrase ?: false
+                    );
+                } catch (Throwable) {
+                    throw new RuntimeException(
+                        'Private key tidak valid atau passphrase tidak sesuai.'
+                    );
+                }
+
+                $authenticated = $ssh->login($server->username, $key);
+            } else {
+                throw new RuntimeException(
+                    'Metode autentikasi SSH tidak didukung.'
+                );
+            }
+
+            if (!$authenticated) {
+                throw new RuntimeException('Autentikasi SSH gagal.');
+            }
+
+            $ssh->setTimeout($operation === 'create' ? 60 : 20);
+
+            // Payload hanya berisi field yang diizinkan untuk operasi ini.
+            $requestPayload = ['operation' => $operation];
+
+            if (in_array($operation, ['create', 'get-config'], true)) {
+                $requestPayload['name'] = $parameters['name'];
+            }
+
+            $payload = json_encode(
+                $requestPayload,
+                JSON_THROW_ON_ERROR
+            );
+
+            // Payload di-escape sebagai argumen shell.
+            // Command executable dan sudo tidak dapat diubah oleh pengguna.
+            $command = 'printf %s ' . escapeshellarg($payload)
+                . ' | sudo -n /usr/local/sbin/rahanpas-wireguard';
+
+            $output = $ssh->exec($command);
+
+            if ($output === false || !is_string($output)) {
+                throw new RuntimeException(
+                    'Tidak dapat menjalankan operasi WireGuard remote.'
+                );
+            }
+
+            $decoded = json_decode(trim($output), true);
+
+            if (
+                !is_array($decoded) ||
+                json_last_error() !== JSON_ERROR_NONE ||
+                ($decoded['success'] ?? false) !== true ||
+                ($decoded['operation'] ?? null) !== $operation
+            ) {
+                throw new RuntimeException(
+                    'Respons WireGuard remote tidak valid.'
+                );
+            }
+
+            if ($operation === 'create') {
+                $peer = $decoded['peer'] ?? null;
+                $config = $decoded['config'] ?? null;
+                $qrBase64 = $decoded['qr_png_base64'] ?? null;
+
+                if (
+                    !is_array($peer) ||
+                    ($peer['name'] ?? null) !== $parameters['name'] ||
+                    !is_string($peer['public_key'] ?? null) ||
+                    !preg_match(
+                        '/\\A[A-Za-z0-9+\\/]{43}=\\z/',
+                        $peer['public_key']
+                    ) ||
+                    !is_string($peer['address'] ?? null) ||
+                    !str_ends_with($peer['address'], '/32') ||
+                    filter_var(
+                        substr($peer['address'], 0, -3),
+                        FILTER_VALIDATE_IP,
+                        FILTER_FLAG_IPV4
+                    ) === false ||
+                    !is_string($config) ||
+                    !str_contains($config, '[Interface]') ||
+                    !str_contains($config, '[Peer]') ||
+                    !str_contains($config, 'PrivateKey = ') ||
+                    !is_string($qrBase64)
+                ) {
+                    throw new RuntimeException(
+                        'Respons pembuatan peer WireGuard tidak valid.'
+                    );
+                }
+
+                $qrBytes = base64_decode($qrBase64, true);
+
+                if (
+                    $qrBytes === false ||
+                    !str_starts_with($qrBytes, "\x89PNG\r\n\x1a\n")
+                ) {
+                    throw new RuntimeException(
+                        'Data QR WireGuard tidak valid.'
+                    );
+                }
+            } elseif ($operation === 'get-config') {
+                $configBase64 = $decoded['config_base64'] ?? null;
+                $qrBase64 = $decoded['qr_png_base64'] ?? null;
+
+                if (
+                    ($decoded['name'] ?? null) !== $parameters['name'] ||
+                    !is_string($configBase64) ||
+                    !is_string($qrBase64)
+                ) {
+                    throw new RuntimeException(
+                        'Respons konfigurasi peer WireGuard tidak valid.'
+                    );
+                }
+
+                $decoded['peer'] = [
+                    'name' => $decoded['name'],
+                ];
+                unset($decoded['name']);
+
+                $configBytes = base64_decode($configBase64, true);
+                $qrBytes = base64_decode($qrBase64, true);
+
+                if (
+                    $configBytes === false ||
+                    $configBytes === '' ||
+                    strlen($configBytes) > 65536 ||
+                    !str_contains($configBytes, '[Interface]') ||
+                    !str_contains($configBytes, '[Peer]') ||
+                    !preg_match('/^PrivateKey\s*=\s*\S+/m', $configBytes) ||
+                    $qrBytes === false ||
+                    !str_starts_with($qrBytes, "\x89PNG\r\n\x1a\n") ||
+                    strlen($qrBytes) > 524288
+                ) {
+                    throw new RuntimeException(
+                        'Isi konfigurasi atau QR peer WireGuard tidak valid.'
+                    );
+                }
+
+                $decoded['config'] = $configBytes;
+                unset($decoded['config_base64']);
+            }
+
+            return $decoded;
+        } catch (RuntimeException $exception) {
+            throw $exception;
+        } catch (Throwable) {
+            throw new RuntimeException(
+                'Terjadi kesalahan saat berkomunikasi dengan WireGuard melalui SSH.'
+            );
+        } finally {
+            $ssh->disconnect();
+        }
+    }
 }

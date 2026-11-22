@@ -2,6 +2,7 @@
 
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ServerController;
+use App\Http\Controllers\Api\WireGuardController;
 use App\Http\Controllers\Api\MonitoringController;
 use App\Http\Controllers\Api\RemoteFileManagerController;
 use App\Http\Controllers\Api\OnlyOfficeController;
@@ -30,6 +31,20 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/servers', [ServerController::class, 'index'])->middleware('permission:server.view');
     Route::post('/servers', [ServerController::class, 'store'])->middleware('permission:server.create');
     Route::get('/servers/{id}', [ServerController::class, 'show'])->middleware('permission:server.view');
+
+
+    // WireGuard
+    Route::get('/servers/{id}/wireguard/status', [WireGuardController::class, 'status'])
+        ->middleware(['permission:wireguard.view', 'throttle:30,1']);
+
+    Route::get('/servers/{id}/wireguard/peers', [WireGuardController::class, 'peers'])
+        ->middleware(['permission:wireguard.view', 'throttle:30,1']);
+
+    Route::post('/servers/{id}/wireguard/peers', [WireGuardController::class, 'createPeer'])
+        ->middleware(['permission:wireguard.manage', 'throttle:5,1,wireguard-peer-create']);
+
+    Route::get('/servers/{id}/wireguard/peers/{name}/config', [WireGuardController::class, 'getPeerConfig'])
+        ->middleware(['permission:wireguard.manage', 'throttle:10,1']);
 
     Route::get('/servers/{id}/monitoring', [MonitoringController::class, 'show'])
         ->middleware(['permission:monitoring.view', 'throttle:120,1']);
