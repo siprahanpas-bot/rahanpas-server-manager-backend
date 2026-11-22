@@ -43,6 +43,7 @@ class ManagedServer extends Model
             'private_key' => 'encrypted',
             'private_key_passphrase' => 'encrypted',
             'verify_host_key' => 'boolean',
+            'is_wireguard_server' => 'boolean',
             'last_checked_at' => 'datetime',
         ];
     }

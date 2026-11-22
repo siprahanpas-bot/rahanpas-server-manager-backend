@@ -77,6 +77,7 @@ class ServerController extends Controller
     {
         $user = $request->user();
         $servers = $user->managedServers()
+            ->where('is_wireguard_server', false)
             ->with('latestMetric')
             ->latest()
             ->paginate(20);

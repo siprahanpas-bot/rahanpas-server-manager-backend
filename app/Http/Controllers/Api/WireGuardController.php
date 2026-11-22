@@ -34,6 +34,175 @@ class WireGuardController extends Controller
     }
 
     /**
+     * GET /wireguard/servers
+     *
+     * Daftar server Linux/SSH milik user yang dapat diakses
+     * melalui permission WireGuard, tanpa membutuhkan server.view.
+     */
+    public function indexServers(
+        Request $request,
+        ManagedServerAccessService $accessService
+    ): JsonResponse {
+        $servers = $request->user()
+            ->managedServers()
+            ->where('os_type', 'linux')
+            ->where('connection_protocol', 'ssh')
+            ->where('is_wireguard_server', true)
+            ->latest()
+            ->get([
+                'id',
+                'name',
+                'hostname',
+                'ip_address',
+                'os_type',
+                'connection_protocol',
+                'status',
+                'last_checked_at',
+            ]);
+
+        $items = $servers->map(function (ManagedServer $server) use ($request, $accessService) {
+            return [
+                'id' => $server->id,
+                'name' => $server->name,
+                'hostname' => $server->hostname,
+                'ip_address' => $server->ip_address,
+                'os_type' => $server->os_type,
+                'connection_protocol' => $server->connection_protocol,
+                'status' => $server->status,
+                'last_checked_at' => $server->last_checked_at,
+                'ip_access' => $accessService->resolveIpAccess(
+                    $request->user(),
+                    $server->ip_address,
+                    $server->hostname
+                ),
+            ];
+        });
+
+        return response()->json([
+            'servers' => $items,
+            'total' => $items->count(),
+        ]);
+    }
+
+    /**
+     * GET /wireguard/candidates
+     *
+     * Kandidat berasal dari record server milik user yang belum
+     * diklasifikasikan sebagai WireGuard Server.
+     */
+    public function candidates(
+        Request $request,
+        ManagedServerAccessService $accessService
+    ): JsonResponse {
+        $servers = $request->user()
+            ->managedServers()
+            ->where('os_type', 'linux')
+            ->where('connection_protocol', 'ssh')
+            ->where('is_wireguard_server', false)
+            ->latest()
+            ->get([
+                'id',
+                'name',
+                'hostname',
+                'ip_address',
+                'os_type',
+                'connection_protocol',
+                'status',
+            ]);
+
+        $items = $servers->map(function (ManagedServer $server) use ($request, $accessService) {
+            return [
+                'id' => $server->id,
+                'name' => $server->name,
+                'hostname' => $server->hostname,
+                'ip_address' => $server->ip_address,
+                'status' => $server->status,
+                'ip_access' => $accessService->resolveIpAccess(
+                    $request->user(),
+                    $server->ip_address,
+                    $server->hostname
+                ),
+            ];
+        });
+
+        return response()->json([
+            'candidates' => $items,
+            'total' => $items->count(),
+        ]);
+    }
+
+    /**
+     * POST /wireguard/servers/{id}/register
+     *
+     * Mendaftarkan record server yang sudah ada setelah deteksi SSH
+     * read-only memastikan terdapat interface WireGuard aktif.
+     */
+    public function registerServer(
+        Request $request,
+        int $id,
+        SshConnectionService $sshService,
+        ManagedServerAccessService $accessService
+    ): JsonResponse {
+        $server = $request->user()
+            ->managedServers()
+            ->findOrFail($id);
+
+        $accessService->assertIpAllowedForView(
+            $request->user(),
+            $server
+        );
+
+        if (
+            $server->os_type !== 'linux' ||
+            $server->connection_protocol !== 'ssh'
+        ) {
+            return response()->json([
+                'message' => 'Hanya server Linux dengan koneksi SSH yang dapat didaftarkan.',
+            ], 422);
+        }
+
+        if ($server->is_wireguard_server) {
+            return response()->json([
+                'message' => 'Server ini sudah terdaftar sebagai WireGuard Server.',
+                'server_id' => $server->id,
+            ], 409);
+        }
+
+        try {
+            $supported = $sshService->detectWireGuardSupport($server);
+
+            if (!$supported) {
+                return response()->json([
+                    'message' => 'Interface WireGuard aktif tidak ditemukan. Server tidak didaftarkan.',
+                ], 422);
+            }
+
+            $server->forceFill([
+                'is_wireguard_server' => true,
+            ])->save();
+
+            return response()->json([
+                'message' => 'Server berhasil didaftarkan sebagai WireGuard Server.',
+                'server' => [
+                    'id' => $server->id,
+                    'name' => $server->name,
+                    'hostname' => $server->hostname,
+                    'ip_address' => $server->ip_address,
+                ],
+            ], 201);
+        } catch (Throwable $exception) {
+            Log::warning('WireGuard server registration detection failed.', [
+                'server_id' => $server->id,
+                'exception' => get_class($exception),
+            ]);
+
+            return response()->json([
+                'message' => 'Pemeriksaan SSH atau deteksi WireGuard gagal. Server belum didaftarkan.',
+            ], 502);
+        }
+    }
+
+    /**
      * GET /servers/{id}/wireguard/status
      */
     public function status(

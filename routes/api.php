@@ -34,6 +34,15 @@ Route::middleware('auth:sanctum')->group(function () {
 
 
     // WireGuard
+    Route::get('/wireguard/candidates', [WireGuardController::class, 'candidates'])
+        ->middleware(['permission:wireguard.manage', 'throttle:60,1']);
+
+    Route::post('/wireguard/servers/{id}/register', [WireGuardController::class, 'registerServer'])
+        ->middleware(['permission:wireguard.manage', 'throttle:5,1']);
+
+    Route::get('/wireguard/servers', [WireGuardController::class, 'indexServers'])
+        ->middleware(['permission:wireguard.view', 'throttle:60,1']);
+
     Route::get('/servers/{id}/wireguard/status', [WireGuardController::class, 'status'])
         ->middleware(['permission:wireguard.view', 'throttle:30,1']);
 
